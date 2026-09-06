@@ -161,12 +161,23 @@ def process_franka_rollouts(
             "The actor's BC pool is success-only, so nothing distils toward them."
         )
 
-    for ep, success in episodes:
+    import time  # noqa: PLC0415
+
+    t_start = time.time()
+    for k, (ep, success) in enumerate(episodes, 1):
+        t_ep = time.time()
         try:
+            n_before = [0]
+            # Progress matters here: decoding two 720p HEVC videos per episode is
+            # minutes of wall clock with no other output, which reads as a hang.
+            logging.info("[seed %d/%d] %s (%s)", k, len(episodes), ep.name,
+                         "success" if success else "failure")
             yield from _episode_transitions(
                 ep, success, task_config, action_horizon, stride, prompt,
                 side_camera, wrist_camera, image_tools,
             )
+            logging.info("[seed %d/%d] done in %.1fs (%.1f min elapsed)",
+                         k, len(episodes), time.time() - t_ep, (time.time() - t_start) / 60.0)
         except Exception:  # noqa: BLE001
             logging.exception("skipping rollout %s", ep.name)
 
