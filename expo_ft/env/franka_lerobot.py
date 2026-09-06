@@ -90,6 +90,24 @@ def process_franka_lerobot_dataset(
         data_config.repo_id, n_eps, len(ep_from), stride, task_config.control_hz,
         stride / float(task_config.control_hz),
     )
+    # Provenance, printed every run: the demos that seed the buffer and the norm
+    # stats that normalize them can come from DIFFERENT datasets, and that is a
+    # deliberate, load-bearing choice — the stats must stay the SFT checkpoint's
+    # (so RL lives in the space the frozen baseline was measured in) while the
+    # demos are whatever expert data this box actually has. Say both out loud so a
+    # silent dataset swap is visible in the log instead of in the results.
+    logging.info(
+        "  demos:      %s (%d episodes on this box)", data_config.repo_id, len(ep_from)
+    )
+    logging.info(
+        "  norm stats: asset_id %s from the SFT checkpoint's assets", data_config.asset_id
+    )
+    if data_config.asset_id and data_config.repo_id != data_config.asset_id:
+        logging.warning(
+            "  demo set != norm-stats set. Fine when they are re-conversions of the same "
+            "task (the stats are dataset-level and the SFT's are the ones that matter), "
+            "but NOT interchangeable with the SFT's own training episodes."
+        )
 
     transitions = []
     for ep in tqdm(range(n_eps), desc="seeding demos"):

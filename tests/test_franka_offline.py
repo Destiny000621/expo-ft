@@ -9,6 +9,8 @@ seconds against the real openpi transforms and the real norm stats.
     JAX_PLATFORMS=cpu pytest tests/test_franka_offline.py -q
 """
 
+import pathlib
+
 import numpy as np
 import pytest
 
@@ -361,3 +363,98 @@ def test_learner_networks_build_with_the_right_shapes(pi05_config, task, model_c
     assert agent.discount_power == 1 and agent.discount == pytest.approx(0.99)
     assert agent.N == 8 and agent.n_edit_samples == 8
     assert agent.target_entropy == pytest.approx(-agent.full_action_dim / 2)
+
+
+# ---------------------------------------------------------- rollout seeding
+
+ROLLOUT_DIRS = [
+    pathlib.Path("~/Desktop/Haply_Franka/data_log_eval_wcrop").expanduser(),
+    pathlib.Path("~/expo_seed/data_log_eval_wcrop").expanduser(),
+    pathlib.Path("~/stage_expo/seed/data_log_eval_wcrop").expanduser(),
+]
+
+
+def _rollout_root():
+    for p in ROLLOUT_DIRS:
+        if p.exists():
+            return p
+    pytest.skip("no recorded rollouts on this box")
+
+
+def test_rollout_seed_matches_the_live_wire(task):
+    """One decision out of a recorded rollout must look like a live decision.
+
+    The buffer cannot tell seeded data from online data, so anything that differs
+    here is a silent distribution shift the critic will learn as signal: a gripper
+    column in the wrong units, a side frame resampled differently than the client
+    resamples it, a pre-cropped wrist, or a rotation that is not a rotation.
+    """
+    import itertools
+
+    from expo_ft.env.franka_rollout_seed import find_rollout_episodes, process_franka_rollouts
+
+    root = _rollout_root()
+    episodes = find_rollout_episodes(root, include_failures=True)
+    assert episodes, "no episodes found under the rollout root"
+    assert any(s for _, s in episodes), "no SUCCESS episodes — nothing for the actor's BC pool"
+
+    transitions = list(
+        itertools.islice(
+            process_franka_rollouts(
+                root, task, action_horizon=task.action_horizon, num_episodes=1, include_failures=True
+            ),
+            4,
+        )
+    )
+    assert transitions, "the first rollout yielded no decisions"
+    tr = transitions[0]
+    obs = tr["observations"]
+
+    # The side view is pad-resized to 224 by the CLIENT; the wrist goes raw,
+    # because the wrist crop is a learner-side transform.
+    assert obs["observation/image"].shape == (224, 224, 3)
+    assert obs["observation/image"].dtype == np.uint8
+    assert obs["observation/wrist_image"].shape[0] > 224, "wrist frame must stay uncropped/unresized"
+
+    state = obs["observation/state"]
+    assert state.shape == (task.state_dim,)
+    # Gripper in KNUCKLE RADIANS, not the recorder's 0-1 position: the checkpoint's
+    # own norm stats have q99 = 0.7263 on this column.
+    assert 0.0 <= float(state[9]) <= 0.7929 + 1e-3
+    # rot6d must be an orthonormal frame, or Gram-Schmidt on the robot side
+    # silently invents a different rotation.
+    cols = np.stack([state[3:6], state[6:9]], axis=1)
+    np.testing.assert_allclose(np.linalg.norm(cols, axis=0), 1.0, atol=1e-3)
+    assert abs(float(cols[:, 0] @ cols[:, 1])) < 1e-3
+
+    chunk = tr["actions"]
+    assert chunk.shape == (task.action_horizon, task.action_dim)
+    assert 0.0 <= float(chunk[0, 9]) <= 0.7929 + 1e-3
+    # The recorded command LEADS the measured pose (that lead times the impedance
+    # spring is what produced insertion force in the demos). A few mm to a few cm
+    # is right; metres would mean state and action came from different frames.
+    lead_mm = float(np.linalg.norm(chunk[0, :3] - state[:3])) * 1000.0
+    assert 0.1 < lead_mm < 150.0, f"command-vs-measured lead {lead_mm:.1f} mm is not plausible"
+
+    # Non-terminal decisions bootstrap; only the last one of an episode does not.
+    assert float(tr["masks"]) == 1.0 and not tr["dones"]
+    assert float(tr["rewards"]) == 0.0
+
+
+def test_seeded_rollout_transition_enters_the_buffer(pi05_config, task):
+    """A seeded decision must survive the same transforms an online one does."""
+    import itertools
+
+    from expo_ft.env.franka_rollout_seed import process_franka_rollouts
+
+    root = _rollout_root()
+    buf = _buffer(pi05_config, task, capacity=8)
+    for tr in itertools.islice(
+        process_franka_rollouts(root, task, action_horizon=task.action_horizon, num_episodes=1), 3
+    ):
+        row = buf.insert(tr)
+    assert len(buf) == 3
+    assert row["base_image"].shape == (224, 224, 3)
+    assert row["actions"].shape == (task.action_horizon, pi05_config.model.action_dim)
+    batch = buf.sample_jax(4)
+    assert batch["state"].shape == (4, pi05_config.model.action_dim)

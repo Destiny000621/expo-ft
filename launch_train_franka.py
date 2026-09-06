@@ -42,18 +42,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint_buffer", type=int, default=1,
                    help="persist each episode's preprocessed rows so a run can be resumed")
 
-    # --- demo seeding -------------------------------------------------------
-    p.add_argument("--num_data", type=int, default=100,
-                   help="demo EPISODES to seed into the buffer (0 = none, -1 = all)")
+    # --- buffer seeding -----------------------------------------------------
+    # Default: this station's own recorded pi0.5 rollouts. They are on-policy for
+    # the checkpoint RL starts from, and they carry recorded FAILURES — the
+    # negative signal a success-only seed cannot give the critic, and the signal
+    # the online run would otherwise have to buy with robot episodes.
+    p.add_argument("--seed_source", choices=["rollouts", "lerobot", "none"], default="rollouts")
+    p.add_argument("--rollout_seed_dir", default="",
+                   help="recorder directory of pi0.5 rollouts (e.g. data_log_eval_wcrop)")
+    p.add_argument("--rollout_include_failures", type=int, default=1,
+                   help="also seed failed rollouts as critic data (rewards 0, terminal). "
+                        "The actor's BC pool stays success-only regardless")
+    p.add_argument("--num_data", type=int, default=0,
+                   help="max EPISODES to seed from the chosen source (0 = all)")
     p.add_argument("--dataset_repo_id", default="",
-                   help="override the TrainConfig's LeRobot repo id (the dataset may be "
-                        "re-converted under a different name on the learner box)")
+                   help="--seed_source lerobot only, and REQUIRED there: the demo set that "
+                        "matches this checkpoint is not necessarily the one on this box")
     p.add_argument("--seed_stride", type=int, default=0,
                    help="frames between seeded decisions (0 = replan_steps, which matches "
                         "the granularity of the online data)")
     p.add_argument("--seed_cache", default="",
-                   help="pickle path to cache the decoded demo transitions (decoding 100 "
-                        "AV1 episodes takes minutes; the cache makes a restart instant)")
+                   help="pickle path to cache the PREPROCESSED seed rows (decoding the "
+                        "rollout videos takes minutes; the cache makes a restart instant)")
 
     # --- optimisation -------------------------------------------------------
     p.add_argument("--batch_size", type=int, default=64, help="critic minibatch")
@@ -107,6 +117,7 @@ def main() -> None:
             raise SystemExit("--eval needs --resume 1 (and the run_name of the trained run)")
         args.checkpoint_buffer = False
         args.num_data = 0
+        args.seed_source = "none"
     if args.offline_ratio != 0 and args.actor_batch_size:
         raise SystemExit(
             "--actor_batch_size only applies with --offline_ratio 0 (the mixed-batch path "

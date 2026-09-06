@@ -66,26 +66,55 @@ The checkpoint is a FULL fine-tune and the RL model is a LoRA model: openpi's
 (`missing_regex=".*lora.*"`), and `freeze_filter` then trains only those. That is
 the intended path, not a workaround.
 
-### c. The demo dataset (buffer seeding)
+### c. Warm-start data: this station's own rollouts
 
-The 100 SFT demos seed the replay buffer, sampled at decision granularity
-(every `replan_steps` frames ≈ 46 decisions per episode, ~4.6k transitions).
-Copy the LeRobot dataset to the learner box:
+The buffer is seeded from recorded pi0.5 **rollouts** (`data_log_eval_wcrop`),
+not from teleop demos. They are on-policy for the checkpoint RL starts from, they
+already look like the online data (same plant, cameras and episode structure), and
+they bring recorded **failures** — the negative signal a success-only seed cannot
+give a critic, and the signal the online run would otherwise buy with robot time.
+Successes are what the actor learns from: the BC pool is success-only by config, so
+nothing distils toward a failed rollout.
+
+As of 2026-09-06 that directory holds **38 episodes, 15 of them successes**
+(`metadata.json: success` and a `SUCCESS` marker file agree on every one).
 
 ```bash
-rsync -a ~/.cache/huggingface/lerobot/local/double_cable_100_r6_v22 \
-  <learner>:~/.cache/huggingface/lerobot/local/
-# then, if the name differs from the TrainConfig's:
---dataset_repo_id local/double_cable_100_r6_v22
+rsync -a ~/Desktop/Haply_Franka/data_log_eval_wcrop <learner>:~/expo_seed/
+# the learner reads it via --rollout_seed_dir (run_franka.sh: ROLLOUT_DIR=...)
 ```
 
-Decoding 100 AV1 episodes takes minutes; `--seed_cache <path.pkl>` makes every
-restart after the first instant.
+Decoding the videos takes minutes, so `--seed_cache <path.pkl>` stores the
+PREPROCESSED rows (224 px) and makes every later start instant.
+
+Three conversions in that loader are load-bearing, and all three are gated by
+`tests/test_franka_offline.py`:
+
+* **gripper in radians.** The recorder stores `gripper_pos` in 0-1 (1 = open); the
+  checkpoint expects knuckle radians (its own norm stats: state q99 = 0.7263,
+  action q99 = 0.7927), so the loader applies the deploy client's own mapping
+  `rad = (1 - pos) * 0.7929`. Seeding the raw 0-1 column would look completely
+  reasonable and be wrong in every state.
+* **side frame pre-resized, wrist frame raw** — exactly what the live client puts
+  on the wire, so seeded and online pixels went through the same resampling.
+* **rot6d from `ee_pose` / `target_pose`**, using openpi's own converter routine.
+  A sanity number worth knowing: the commanded pose LEADS the measured pose by
+  ~18 mm in these recordings, which is the impedance lead the demos were collected
+  with — if that number ever comes out near zero or in metres, state and action are
+  being read from different frames.
+
+Seeding from the SFT LeRobot demos is still available
+(`--seed_source lerobot --dataset_repo_id <repo>`), but the repo id is REQUIRED
+there: the demo conversion that matches this checkpoint
+(`local/double_cable_100_r6_v21`, 100 episodes / 115,284 frames) is not
+necessarily the one sitting on a given box — the station currently has
+`double_cable_100_r6_v22`, which is a **99-episode** re-conversion (115,666
+frames), i.e. a different episode selection. Do not seed from it by accident.
 
 ### d. Offline gates
 
 ```bash
-JAX_PLATFORMS=cpu .venv/bin/python -m pytest tests/test_franka_offline.py -q   # 12 gates
+JAX_PLATFORMS=cpu .venv/bin/python -m pytest tests/test_franka_offline.py -q   # 14 gates
 # robot side, from ~/Desktop/Haply_Franka:
 pixi run pytest tests/test_expo_agent.py -q                                    # 9 gates
 ```
@@ -169,13 +198,16 @@ Upstream's values unless the "why" column says otherwise.
 | `batch_size` (critic) | **64** | upstream |
 | `actor_batch_size` | **16** | the actor step is a pi0.5 backward pass; upstream ran both at 64 on 4 GPUs |
 | `use_full_augmentation` | **False** (crop only) | rotate/colour-jitter fights a checkpoint trained on a fixed wrist crop |
-| `num_data` | **all 100 demos** | seeded at decision stride into the online buffer (upstream's `offline_ratio=0` path) |
+| `seed_source` | **rollouts** | `data_log_eval_wcrop`, seeded at decision stride into the online buffer (upstream's `offline_ratio=0` path) |
+| `rollout_include_failures` | **1** | recorded failures are critic data (rewards 0, terminal); the actor's BC pool stays success-only |
+| `num_data` | **0 = all** | 38 rollout episodes -> roughly 1.7k seeded decisions |
 | `min_episodes_before_update` | **1** | upstream waits for 10 collected episodes; with the demos seeded there is something to learn from at once, and robot episodes are the scarce resource |
-| `buffer_capacity` | **20,000** | 4.6k seeded + 100 × ~108 ≈ 15.4k. The buffer is a ring: undersize it and it eats its own demos |
+| `buffer_capacity` | **20,000** | ~1.7k seeded + 100 × ~108 ≈ 12.5k. The buffer is a ring: undersize it and it eats its own seed |
 | `max_episode_steps` | **2700** (90 s) | the 100 demos average 38.4 s; same cap as DSRL |
 
-Expected totals over 100 episodes: **~15k transitions**, **~8,000 critic steps**
-and **~400 pi0.5 LoRA steps**.
+**The budget is 100 online robot episodes** (`--num_episodes 100`, the same as the
+DSRL run) — the seeded rollouts are a warm start, not part of it. Expected totals:
+**~12.5k transitions**, **~8,000 critic steps** and **~400 pi0.5 LoRA steps**.
 
 Memory: a stored transition is three 224² uint8 views (~450 KB — the zero
 right-wrist slot pi0.5 pads with is stored too, upstream's layout), so a full run is

@@ -150,8 +150,9 @@ class Learner:
         self.offline_replay.seed(v.seed)
 
         dataset = None
-        if not v.eval and v.num_data != 0:
-            dataset = self._load_seed_dataset()
+        seed_rows = None
+        if not v.eval:
+            seed_rows, dataset = self._seed_source()
 
         self.batch_processor = BatchProcessor(
             replay_buffer=self.replay,
@@ -164,6 +165,10 @@ class Learner:
             use_dagger_hil_sampling=False,
             dataset=dataset,
         )
+        if seed_rows is not None:
+            self._insert_seed_rows(seed_rows)
+        elif dataset is not None:
+            self._write_seed_cache()
         if v.actor_batch_size:
             # The actor batch is a pi0.5 backward pass; the critic batch is a small
             # ResNet. They do not belong at the same size on one GPU.
@@ -247,29 +252,91 @@ class Learner:
     # ------------------------------------------------------------------
     # setup helpers
     # ------------------------------------------------------------------
-    def _load_seed_dataset(self):
-        from expo_ft.env.franka_lerobot import process_franka_lerobot_dataset  # noqa: PLC0415
+    def _seed_source(self):
+        """Return (preprocessed_rows | None, transition_iterable | None).
 
+        The buffer can be warm-started from two places, and only one runs:
+
+        * ``rollouts`` (default) — this station's own recorded pi0.5 rollouts
+          (``data_log_eval_wcrop``). On-policy for the checkpoint RL starts from,
+          and it brings recorded FAILURES, which is the negative signal a
+          success-only seed cannot give the critic.
+        * ``lerobot`` — the SFT demonstrations, upstream's kind of seed. Requires
+          an explicit ``--dataset_repo_id``: the demo set that matches this
+          checkpoint is not the one sitting on every box, and seeding from the
+          wrong conversion is invisible until the results are wrong.
+
+        The cache holds PREPROCESSED rows (224 px, ~450 KB each), not raw
+        transitions: a raw decision carries a 720p wrist frame, so a cached seed
+        set would otherwise be tens of gigabytes.
+        """
         cache = self.v.seed_cache
         if cache and os.path.exists(cache):
-            logger.info("loading seeded transitions from cache %s", cache)
+            logger.info("loading seeded rows from cache %s", cache)
             with open(cache, "rb") as f:
-                return pickle.load(f)
-        dataset = process_franka_lerobot_dataset(
-            self.pi05_train_config,
-            self.task,
-            num_data=int(self.v.num_data),
-            repo_id=self.v.dataset_repo_id or None,
-            prompt=self.prompt,
-            stride=self.v.seed_stride or self.replan_steps,
-        )
-        if cache:
-            tmp = cache + ".tmp"
-            with open(tmp, "wb") as f:
-                pickle.dump(dataset, f, protocol=pickle.HIGHEST_PROTOCOL)
-            os.replace(tmp, cache)
-            logger.info("cached %d seeded transitions to %s", len(dataset), cache)
-        return dataset
+                return pickle.load(f), None
+
+        source = self.v.seed_source
+        if source == "none":
+            logger.warning("no buffer seeding (--seed_source none): the critic starts blank "
+                           "and the first robot episodes pay for that")
+            return None, None
+        if source == "rollouts":
+            from expo_ft.env.franka_rollout_seed import process_franka_rollouts  # noqa: PLC0415
+
+            if not self.v.rollout_seed_dir:
+                raise SystemExit("--seed_source rollouts needs --rollout_seed_dir")
+            return None, process_franka_rollouts(
+                self.v.rollout_seed_dir,
+                self.task,
+                action_horizon=self.pi05_train_config.model.action_horizon,
+                stride=self.v.seed_stride or self.replan_steps,
+                num_episodes=int(self.v.num_data),
+                include_failures=bool(self.v.rollout_include_failures),
+                prompt=self.prompt,
+            )
+        if source == "lerobot":
+            from expo_ft.env.franka_lerobot import process_franka_lerobot_dataset  # noqa: PLC0415
+
+            if not self.v.dataset_repo_id:
+                raise SystemExit(
+                    "--seed_source lerobot needs an explicit --dataset_repo_id (the demo set "
+                    "that matches this checkpoint is not necessarily the one on this box)"
+                )
+            return None, process_franka_lerobot_dataset(
+                self.pi05_train_config,
+                self.task,
+                num_data=int(self.v.num_data),
+                repo_id=self.v.dataset_repo_id,
+                prompt=self.prompt,
+                stride=self.v.seed_stride or self.replan_steps,
+            )
+        raise SystemExit(f"unknown --seed_source {source!r}")
+
+    def _insert_seed_rows(self, rows) -> None:
+        """Re-insert cached preprocessed seed rows (no transforms, no video decode)."""
+        for row in rows:
+            self.replay.insert_row(row)
+        n_succ = int(np.sum(self.replay.dataset_dict["is_success"][: len(self.replay)]))
+        logger.info("seeded %d transitions from cache (%d in the success/BC pool)",
+                    len(rows), n_succ)
+
+    def _write_seed_cache(self) -> None:
+        cache = self.v.seed_cache
+        size = len(self.replay)
+        n_succ = int(np.sum(self.replay.dataset_dict["is_success"][:size]))
+        logger.info("seeded %d transitions (%d in the success/BC pool)", size, n_succ)
+        if not cache or size == 0:
+            return
+        rows = [
+            {k: np.asarray(v[i]) if not isinstance(v, dict) else v for k, v in self.replay.dataset_dict.items()}
+            for i in range(size)
+        ]
+        tmp = cache + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(rows, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache)
+        logger.info("cached %d preprocessed seed rows to %s", size, cache)
 
     def _make_wandb(self):
         if not self.v.wandb_project:
