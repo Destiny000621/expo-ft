@@ -12,6 +12,10 @@
 # config bug and is not one. Point it somewhere that exists.
 # One root for everything the learner box holds. Relocating the whole run is
 # then one variable: EXPO_ROOT=/mnt/localssd/Sichang source scripts/franka/learner_env.sh
+# Default: the local-SSD root on H200-5 when it exists, else $HOME/expo.
+if [ -z "${EXPO_ROOT:-}" ] && [ -d /mnt/localssd/Sichang ]; then
+    EXPO_ROOT=/mnt/localssd/Sichang
+fi
 export EXPO_ROOT="${EXPO_ROOT:-$HOME/expo}"
 
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-$EXPO_ROOT/openpi_cache}"
@@ -28,11 +32,12 @@ export ROLLOUT_DIR="${ROLLOUT_DIR:-$EXPO_ROOT/seed/data_log_eval_wcrop}"
 
 export EXP="${EXP:-$EXPO_ROOT/logs/expo_franka}"
 
-# ALL EIGHT GPUs, data-parallel (openpi's make_mesh(fsdp_devices=1) shards the
-# batch across every visible device). Not for memory — one H200 holds the whole
-# learner at 33 GB — but for the update block: EXPO-FT's critic target draws 8
-# pi0.5 chunks for every state in every minibatch, and that block measured 132 s
-# on one GPU vs 22 s on eight. 22 s fits inside a scene reset; 132 s does not.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+# FOUR GPUs, data-parallel (openpi's make_mesh(fsdp_devices=1) shards the batch
+# across every visible device). Not for memory — one H200 holds the whole learner
+# at 33 GB — but for the update block: EXPO-FT's critic target draws 8 pi0.5 chunks
+# for every state in every minibatch, and that block measured 132 s on one GPU vs
+# 22 s on eight. Four is the budget on this SHARED box (user rule, 2026-09-06);
+# the other four stay free for other people's jobs.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 # Report honest VRAM in nvidia-smi instead of JAX's 75% preallocation.
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"

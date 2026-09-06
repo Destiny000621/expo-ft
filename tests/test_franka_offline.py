@@ -369,6 +369,7 @@ def test_learner_networks_build_with_the_right_shapes(pi05_config, task, model_c
 
 ROLLOUT_DIRS = [
     pathlib.Path("~/Desktop/Haply_Franka/data_log_eval_wcrop").expanduser(),
+    pathlib.Path("/mnt/localssd/Sichang/seed/data_log_eval_wcrop"),
     pathlib.Path("~/expo_seed/data_log_eval_wcrop").expanduser(),
     pathlib.Path("~/stage_expo/seed/data_log_eval_wcrop").expanduser(),
 ]
