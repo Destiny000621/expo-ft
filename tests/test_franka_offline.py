@@ -294,3 +294,70 @@ def test_absolute_chunk_survives_the_normalize_unnormalize_round_trip(pi05_confi
         "anchoring on zeros produced the same chunk — this dataset has no delta "
         "actions, so the round-trip gate is vacuous"
     )
+
+
+# ------------------------------------------------------------- agent shapes
+
+
+def test_learner_networks_build_with_the_right_shapes(pi05_config, task, model_cfg):
+    """Build the critic / edit actor / encoder on CPU with a STUB VLA.
+
+    This is the cheap version of "did the port wire up": it exercises the mesh,
+    the example arrays taken off the buffer, and every dimension the algorithm
+    derives from them — without loading 3B parameters. The numbers asserted here
+    are the ones a shape bug would silently change, and which would then only
+    show up as a critic that scores something other than what was executed.
+    """
+    import jax
+
+    import openpi.training.sharding as sh
+    from expo_ft.agents.alg.expo_ft import load_agent
+    from expo_ft.utils.train_utils import build_pi05_config
+
+    agent_kwargs, _, _, _ = build_pi05_config(dict(model_cfg))
+    freeze = agent_kwargs.pop("freeze_pi05_encoder")
+    agent_kwargs.pop("pi05_use_repack", None)
+
+    _mesh = sh.make_mesh(1)
+    data_sharding = jax.sharding.NamedSharding(_mesh, jax.sharding.PartitionSpec(sh.DATA_AXIS))
+    replicated = jax.sharding.NamedSharding(_mesh, jax.sharding.PartitionSpec())
+
+    buf = _buffer(pi05_config, task, capacity=4)
+    obs, state, act = buf.convert_to_critic_format(
+        {
+            "base_image": buf.dataset_dict["base_image"][0],
+            "left_wrist_image": buf.dataset_dict["left_wrist_image"][0],
+            "state": buf.dataset_dict["state"][0],
+            "actions": buf.dataset_dict["actions"][0],
+        }
+    )
+    # Two REAL cameras channel-concatenated at the model's own resolution; the
+    # zero right-wrist slot pi0.5 pads with is deliberately not fed to the critic.
+    assert obs.shape == (224, 224, 6)
+    assert state.shape == (pi05_config.model.action_dim,)   # padded state
+    assert act.shape == (task.action_horizon, task.action_dim)
+
+    class _StubActor:
+        infer_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        model_config = pi05_config.model
+        mesh = _mesh
+        action_dim = task.action_dim
+        state_dim = pi05_config.model.action_dim
+
+    agent = load_agent(
+        seed=0, example_observation=obs, example_action=act, example_state=state,
+        actor=_StubActor(), actor_train_state=None, target_actor_params=None,
+        agent_kwargs=agent_kwargs,
+        metadata=dict(action_horizon=task.action_horizon, resize_size=224, freeze_encoder=freeze),
+        mesh=_mesh, data_sharding=data_sharding, replicated_sharding=replicated,
+        resume=True,  # skip cache_infer_params: it needs a real pi0.5 train state
+        replan_steps=task.replan_steps, default_prompt=task.language_instruction,
+        residual_action_xyzg=task.residual_action_xyzg,
+    )
+    # The critic scores exactly the rows the arm executes: replan_steps x action_dim.
+    assert agent.full_action_dim == task.replan_steps * task.action_dim == 250
+    assert agent.action_dim == task.action_dim
+    assert agent.replan_steps == task.replan_steps
+    assert agent.discount_power == 1 and agent.discount == pytest.approx(0.99)
+    assert agent.N == 8 and agent.n_edit_samples == 8
+    assert agent.target_entropy == pytest.approx(-agent.full_action_dim / 2)

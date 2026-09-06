@@ -85,7 +85,7 @@ restart after the first instant.
 ### d. Offline gates
 
 ```bash
-JAX_PLATFORMS=cpu .venv/bin/python -m pytest tests/test_franka_offline.py -q   # 11 gates
+JAX_PLATFORMS=cpu .venv/bin/python -m pytest tests/test_franka_offline.py -q   # 12 gates
 # robot side, from ~/Desktop/Haply_Franka:
 pixi run pytest tests/test_expo_agent.py -q                                    # 9 gates
 ```

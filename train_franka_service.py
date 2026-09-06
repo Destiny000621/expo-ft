@@ -544,6 +544,11 @@ class Learner:
             self.total_traj = c.get("total_traj", 0)
             self.total_env_steps = c.get("total_env_steps", 0)
             self.successes = c.get("successes", [])
+        if self.v.eval:
+            # An eval restores WEIGHTS, not data: re-inserting a whole run's rows
+            # costs minutes and the buffer is never read in eval mode.
+            logger.info("eval mode: skipping the replay-buffer restore")
+            return
         files = sorted(f for f in os.listdir(self.rows_dir) if f.endswith(".pkl"))
         for name in files:
             with open(os.path.join(self.rows_dir, name), "rb") as f:
