@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed_stride", type=int, default=0,
                    help="frames between seeded decisions (0 = replan_steps, which matches "
                         "the granularity of the online data)")
+    p.add_argument("--allow_inline_seeding", type=int, default=0,
+                   help="decode the rollout videos inside the learner process. Off by "
+                        "default: this process holds a CUDA context and JAX's thread "
+                        "pools, and ffmpeg's decode threads on a many-core box wedged it. "
+                        "Use scripts/franka/build_seed_cache.py instead")
     p.add_argument("--seed_cache", default="",
                    help="pickle path to cache the PREPROCESSED seed rows (decoding the "
                         "rollout videos takes minutes; the cache makes a restart instant)")

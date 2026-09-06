@@ -401,8 +401,14 @@ class Pi05Agent(Model):
 
     def process_raw_inputs(self, raw_observations, action_dim, resize_size, normalize=True):
         """Convert raw env observations into a batched model-ready Observation dict."""
-        # create a dummy actions
-        raw_observations["actions"] = np.zeros(action_dim)
+        # A dummy action, shaped like a real CHUNK. Upstream writes np.zeros(action_dim)
+        # — a single row — which works only because the DROID data config has no
+        # DeltaActions: a delta config does `actions[..., :d] -= state[..., None, :d]`,
+        # and a 1-D action makes that a (9,) -= (1,9) broadcast error at the FIRST
+        # live decision. The value is discarded either way; only its shape matters.
+        raw_observations["actions"] = np.zeros(
+            (self.model_config.action_horizon, action_dim), dtype=np.float32
+        )
         for key, value in raw_observations.items():
             raw_observations[key] = np.asarray(value)
             if "image" in key:

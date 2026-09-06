@@ -66,27 +66,67 @@ def _gripper_rad(position_0_1: np.ndarray) -> np.ndarray:
     return ((1.0 - np.asarray(position_0_1, np.float32).reshape(-1)) * GRIPPER_MAX_RAD).astype(np.float32)
 
 
-def _decode_frames(path: pathlib.Path, wanted: np.ndarray) -> dict[int, np.ndarray]:
-    """Decode only the frame indices in `wanted` from an mp4, as uint8 RGB HWC.
+def _hold_fill(rows: np.ndarray, name: str, ep_name: str) -> np.ndarray:
+    """Replace non-finite rows with the last valid one (the arm held that command).
 
-    PyAV, not OpenCV: these recordings are HEVC (and the LeRobot demo videos are
-    AV1, which OpenCV fails on SILENTLY — it returns False rather than raising).
-    Sequential decode with a skip set is deliberate; seeking per frame on a
-    fragmented recording is slower and can land off-keyframe.
+    The recorder writes NaN for a tick the agent did not command — `active=False`,
+    which is what a pi0.5 rollout does while it waits for the next chunk or while the
+    pose stream is stale. Physically the arm held its previous Cartesian target
+    (the impedance controller keeps the last one), so a hold-fill is not a repair of
+    corrupt data: it is the command that was actually in force. 15-150 such ticks per
+    episode appear in the 2026-09-05 rollouts, and scipy rejects them outright
+    ("Found zero norm quaternions"), which silently costs a whole episode.
+
+    A leading run of invalid rows is back-filled from the first valid one, since
+    there is no earlier command to hold.
     """
-    import av  # noqa: PLC0415
+    bad = ~np.isfinite(rows).all(axis=1)
+    if not bad.any():
+        return rows
+    if bad.all():
+        raise ValueError(f"{ep_name}: every {name} row is non-finite")
+    idx = np.where(~bad, np.arange(len(rows)), 0)
+    np.maximum.accumulate(idx, out=idx)
+    filled = rows[idx].copy()
+    first_valid = int(np.argmax(~bad))
+    if first_valid > 0:
+        filled[:first_valid] = rows[first_valid]
+    logging.info("[%s] %s: hold-filled %d/%d ticks the agent did not command",
+                 ep_name, name, int(bad.sum()), len(rows))
+    return filled
 
-    want = set(int(i) for i in wanted)
-    out: dict[int, np.ndarray] = {}
-    with av.open(str(path)) as container:
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
-        for idx, frame in enumerate(container.decode(stream)):
-            if idx in want:
-                out[idx] = frame.to_ndarray(format="rgb24")
-                if len(out) == len(want):
-                    break
-    return out
+
+def _decode_frames(path: pathlib.Path, wanted: np.ndarray, resize: int = 0) -> dict[int, np.ndarray]:
+    """Decode the frame indices in `wanted` as uint8 RGB HWC.
+
+    Runs in a SUBPROCESS by default (`expo_ft.env.rollout_decode_worker`). In-process
+    decoding is fast in isolation and deadlocks once the learner's stack is loaded —
+    lerobot brings a second libav alongside PyAV's, and ffmpeg's frame threads wedge.
+    Set EXPO_INPROCESS_DECODE=1 to decode here anyway (fine on a machine where only
+    the seeder is running, and ~1 s faster per episode).
+    """
+    import os  # noqa: PLC0415
+
+    if os.environ.get("EXPO_INPROCESS_DECODE") == "1":
+        from expo_ft.env.rollout_decode_worker import decode_frames  # noqa: PLC0415
+
+        return {int(k): v for k, v in decode_frames(str(path), wanted, resize).items()}
+
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory(prefix="expo_decode_") as tmp:
+        idx_path = os.path.join(tmp, "idx.npy")
+        out_path = os.path.join(tmp, "frames.npz")
+        np.save(idx_path, np.asarray(wanted, np.int64))
+        cmd = [sys.executable, "-m", "expo_ft.env.rollout_decode_worker",
+               str(path), idx_path, out_path, "--resize", str(int(resize))]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=900)
+        if proc.returncode != 0:
+            raise RuntimeError(f"decode of {path} failed: {proc.stderr[-2000:]}")
+        with np.load(out_path) as z:
+            return {int(k): np.asarray(z[k]) for k in z.files}
 
 
 def _frame_for_ticks(cam_ts: np.ndarray, ticks: np.ndarray) -> np.ndarray:
@@ -185,18 +225,29 @@ def process_franka_rollouts(
 def _episode_transitions(
     ep, success, task_config, action_horizon, stride, prompt, side_camera, wrist_camera, image_tools
 ):
+    logging.debug("[%s] loading npz", ep.name)
     st = np.load(ep / "arm0_states.npz")
     ac = np.load(ep / "arm0_actions.npz")
     ticks = np.load(ep / "timestamps.npy").astype(np.float64)
+    logging.debug("[%s] npz loaded (%d ticks)", ep.name, len(ticks))
 
+    # Hold-fill BEFORE the rot6d conversion: scipy refuses a NaN quaternion, and an
+    # uncaught one costs the whole episode.
+    ee_pose = _hold_fill(np.asarray(st["ee_pose"], np.float32), "ee_pose", ep.name)
+    target_pose = _hold_fill(np.asarray(ac["target_pose"], np.float32), "target_pose", ep.name)
+    gripper_state = _hold_fill(
+        np.asarray(st["gripper_pos"], np.float32).reshape(-1, 1), "gripper_pos", ep.name
+    )
+    gripper_action = _hold_fill(
+        np.asarray(ac["gripper_target"], np.float32).reshape(-1, 1), "gripper_target", ep.name
+    )
     state = np.concatenate(
-        [_pose7_to_xyz_rot6d(st["ee_pose"].astype(np.float32)),
-         _gripper_rad(st["gripper_pos"])[:, None]], axis=1
+        [_pose7_to_xyz_rot6d(ee_pose), _gripper_rad(gripper_state)[:, None]], axis=1
     )
     action = np.concatenate(
-        [_pose7_to_xyz_rot6d(ac["target_pose"].astype(np.float32)),
-         _gripper_rad(ac["gripper_target"])[:, None]], axis=1
+        [_pose7_to_xyz_rot6d(target_pose), _gripper_rad(gripper_action)[:, None]], axis=1
     )
+    logging.debug("[%s] state/action built", ep.name)
     t = min(len(state), len(action), len(ticks))
     if t < 2 * stride:
         logging.warning("rollout %s has %d ticks (< 2 decisions) — skipping", ep.name, t)
@@ -206,8 +257,11 @@ def _episode_transitions(
     decisions = list(range(0, t - stride, stride))
     side_idx = _frame_for_ticks(np.load(ep / f"{side_camera}_timestamps.npy"), ticks)
     wrist_idx = _frame_for_ticks(np.load(ep / f"{wrist_camera}_timestamps.npy"), ticks)
-    side_frames = _decode_frames(ep / f"{side_camera}.mp4", side_idx[decisions])
+    logging.debug("[%s] decoding %d side frames", ep.name, len(decisions))
+    side_frames = _decode_frames(ep / f"{side_camera}.mp4", side_idx[decisions], resize=224)
+    logging.debug("[%s] decoding %d wrist frames", ep.name, len(decisions))
     wrist_frames = _decode_frames(ep / f"{wrist_camera}.mp4", wrist_idx[decisions])
+    logging.debug("[%s] frames decoded", ep.name)
 
     # Chunk = the rows actually executed from this decision onward, tiled with the
     # last row past the end of the episode — the same quantity build_action_chunks
@@ -227,9 +281,9 @@ def _episode_transitions(
                 # Exactly what the live client puts on the wire: the side view
                 # pad-resized to 224 here, the wrist frame RAW (the crop is a
                 # learner-side transform and rejects a pre-resized wrist).
-                "observation/image": np.ascontiguousarray(
-                    image_tools.resize_with_pad(side, 224, 224), dtype=np.uint8
-                ),
+                # Already pad-resized to 224 by the decode worker — exactly what
+                # the live client puts on the wire.
+                "observation/image": np.ascontiguousarray(side, dtype=np.uint8),
                 "observation/wrist_image": np.ascontiguousarray(wrist, dtype=np.uint8),
                 "observation/state": state[i].astype(np.float32),
                 "prompt": prompt,
@@ -243,3 +297,47 @@ def _episode_transitions(
             # Only successful rollouts enter the actor's success-only BC pool.
             "is_success": bool(success),
         }
+
+
+def rows_for_episode(
+    ep,
+    success: bool,
+    task_config,
+    pi05_train_config,
+    *,
+    resize_size: int = 224,
+    stride: int | None = None,
+    prompt: str | None = None,
+) -> list[dict]:
+    """Preprocess ONE rollout into buffer rows (224 px, normalized, tokenized).
+
+    Split out so seeding can run in worker processes: a row is ~450 KB while the
+    raw decision it came from carries a 720p wrist frame, so returning rows across
+    a process boundary is ~6x cheaper than returning transitions — and doing the
+    decode outside the learner keeps ffmpeg's thread pools away from JAX's.
+    """
+    from expo_ft.data.franka_replay_buffer import FrankaChunkReplayBuffer  # noqa: PLC0415
+
+    transitions = list(
+        _episode_transitions(
+            pathlib.Path(ep),
+            bool(success),
+            task_config,
+            pi05_train_config.model.action_horizon,
+            int(stride or task_config.replan_steps),
+            prompt or task_config.language_instruction,
+            "external_right",
+            "wrist",
+            __import__("openpi_client", fromlist=["image_tools"]).image_tools,
+        )
+    )
+    if not transitions:
+        return []
+    buf = FrankaChunkReplayBuffer(
+        example_action=np.zeros((task_config.action_dim,), np.float32),
+        capacity=len(transitions),
+        pi_train_config=pi05_train_config,
+        resize_size=resize_size,
+        task_description=prompt or task_config.language_instruction,
+    )
+    return [buf.insert(tr) for tr in transitions]

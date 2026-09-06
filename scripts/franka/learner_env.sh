@@ -28,8 +28,11 @@ export ROLLOUT_DIR="${ROLLOUT_DIR:-$EXPO_ROOT/seed/data_log_eval_wcrop}"
 
 export EXP="${EXP:-$EXPO_ROOT/logs/expo_franka}"
 
-# One GPU is plenty (an H200 is 141 GB and the learner's own nets are 38 M params
-# on top of pi0.5); pin it so a second experiment can share the box.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# ALL EIGHT GPUs, data-parallel (openpi's make_mesh(fsdp_devices=1) shards the
+# batch across every visible device). Not for memory — one H200 holds the whole
+# learner at 33 GB — but for the update block: EXPO-FT's critic target draws 8
+# pi0.5 chunks for every state in every minibatch, and that block measured 132 s
+# on one GPU vs 22 s on eight. 22 s fits inside a scene reset; 132 s does not.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 # Report honest VRAM in nvidia-smi instead of JAX's 75% preallocation.
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"

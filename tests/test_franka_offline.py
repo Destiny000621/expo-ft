@@ -458,3 +458,102 @@ def test_seeded_rollout_transition_enters_the_buffer(pi05_config, task):
     assert row["actions"].shape == (task.action_horizon, pi05_config.model.action_dim)
     batch = buf.sample_jax(4)
     assert batch["state"].shape == (4, pi05_config.model.action_dim)
+
+
+def test_uncommanded_ticks_are_hold_filled(task):
+    """Rollouts contain ticks the agent did not command; they must not cost an episode.
+
+    The recorder writes NaN for `active=False` ticks (pi0.5 waiting for its next
+    chunk, or a stale pose stream) — 15-150 per episode in the 2026-09-05 set. scipy
+    rejects a NaN quaternion outright, so without hold-filling, six of thirty-eight
+    rollouts silently dropped out of the seed.
+    """
+    import itertools
+
+    from expo_ft.env.franka_rollout_seed import _hold_fill, find_rollout_episodes, process_franka_rollouts
+
+    rows = np.array([[np.nan, np.nan], [1.0, 2.0], [np.nan, np.nan], [3.0, 4.0]], np.float32)
+    filled = _hold_fill(rows, "test", "ep")
+    np.testing.assert_array_equal(filled[0], [1.0, 2.0])   # leading run: back-filled
+    np.testing.assert_array_equal(filled[2], [1.0, 2.0])   # interior: held
+    np.testing.assert_array_equal(filled[3], [3.0, 4.0])
+    assert np.isfinite(filled).all()
+
+    root = _rollout_root()
+    episodes = find_rollout_episodes(root, include_failures=True)
+    dirty = [
+        (ep, s) for ep, s in episodes
+        if not np.isfinite(np.load(ep / "arm0_actions.npz")["target_pose"]).all()
+    ]
+    if not dirty:
+        pytest.skip("no rollout with uncommanded ticks on this box")
+    ep, success = dirty[0]
+    transitions = list(
+        itertools.islice(
+            process_franka_rollouts(
+                ep.parent, task, action_horizon=task.action_horizon, num_episodes=1,
+                include_failures=True,
+            ),
+            3,
+        )
+    )
+    assert transitions, f"{ep.name} yielded nothing despite hold-filling"
+    for tr in transitions:
+        assert np.isfinite(tr["actions"]).all()
+        assert np.isfinite(tr["observations"]["observation/state"]).all()
+
+
+def test_live_observation_survives_the_input_pipeline(pi05_config, task, model_cfg):
+    """The exact dict the robot sends must pass the transforms the learner applies.
+
+    This is the decision path's front half, and it is where a shape mismatch shows up
+    as a crash at the FIRST live decision rather than in any offline check: the wire
+    carries no actions, the learner injects a dummy one, and a delta-action config
+    subtracts the state from it. A 1-D dummy (upstream's) cannot broadcast against a
+    chunk.
+    """
+    import jax
+
+    import openpi.training.sharding as sh
+    from expo_ft.agents.vla.pi05 import Pi05Agent
+
+    mesh = sh.make_mesh(1)
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    # Constructed directly: this exercises the transform pipeline without loading
+    # 3B parameters (initialize() would).
+    actor = Pi05Agent(
+        train_config=pi05_config,
+        mesh=mesh,
+        train_state_sharding=replicated,
+        data_sharding=jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sh.DATA_AXIS)),
+        replicated_sharding=replicated,
+        default_prompt=task.language_instruction,
+        use_repack=bool(model_cfg.pi05_use_repack),
+    )
+    # The service sets these from the buffer's example arrays after construction.
+    actor.action_dim = task.action_dim
+    actor.state_dim = pi05_config.model.action_dim
+    rng = np.random.default_rng(0)
+    state = np.zeros((task.state_dim,), np.float32)
+    state[:3] = [0.5, 0.0, 0.35]
+    state[3:9] = [1, 0, 0, 0, 1, 0]
+    observation = {
+        "observation/image": rng.integers(0, 255, (224, 224, 3), dtype=np.uint8),
+        # RAW wrist frame, as the client sends it — the learner applies the crop.
+        "observation/wrist_image": rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8),
+        "observation/state": state,
+        "prompt": task.language_instruction,
+    }
+    processed = actor.process_raw_inputs(observation, task.action_dim, 224)
+    assert processed["state"].shape == (1, pi05_config.model.action_dim)
+    assert processed["image"]["base_0_rgb"].shape == (1, 224, 224, 3)
+    assert processed["image"]["left_wrist_0_rgb"].shape == (1, 224, 224, 3)
+    assert processed["tokenized_prompt"].shape[0] == 1
+
+    # And the back half: model-space actions -> absolute chunk, anchored on that state.
+    fake = np.zeros((2, pi05_config.model.action_horizon, task.action_dim), np.float32)
+    out = actor.process_transformed_outputs(fake, state=processed["state"])
+    assert out.shape == (2, pi05_config.model.action_horizon, task.action_dim)
+    # Zero normalized actions do NOT decode to zero: they unnormalize and then get
+    # the current pose added back, so the chunk must land near the robot.
+    assert np.linalg.norm(out[0, 0, :3] - state[:3]) < 0.5

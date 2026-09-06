@@ -114,12 +114,34 @@ frames), i.e. a different episode selection. Do not seed from it by accident.
 ### d. Offline gates
 
 ```bash
-JAX_PLATFORMS=cpu .venv/bin/python -m pytest tests/test_franka_offline.py -q   # 14 gates
+JAX_PLATFORMS=cpu .venv/bin/python -m pytest tests/test_franka_offline.py -q   # 16 gates
 # robot side, from ~/Desktop/Haply_Franka:
 pixi run pytest tests/test_expo_agent.py -q                                    # 9 gates
 ```
 
 ---
+
+### e. Learner-box procedure (H200-5), in order
+
+```bash
+cd <EXPO_ROOT>/code/expo_ft
+EXPO_ROOT=<EXPO_ROOT> source scripts/franka/learner_env.sh     # paths + all 8 GPUs
+# once per rollout set (~3.5 min, CPU only, NOT inside the learner — see the script):
+python scripts/franka/build_seed_cache.py --rollout_dir $ROLLOUT_DIR --out $EXP/seed_rows.pkl
+bash scripts/franka/run_franka.sh                                # loads the cache, listens
+```
+
+Three things on that box that look like bugs and are not:
+
+* `~/.cache/openpi` and `~/.cache/huggingface` are symlinks onto the ephemeral
+  local SSD; when its target is missing, norm-stat loading dies with a
+  `FileNotFoundError` deep inside openpi. `learner_env.sh` points
+  `OPENPI_DATA_HOME` at a real directory instead.
+* `~/.profile` sources a file under that same missing path, so **login shells**
+  (`bash -l`, `ssh -t`) print an error; use plain `bash`.
+* decoding rollout video inside a process that has imported the learner's stack
+  (lerobot brings a second libav) deadlocks silently — that is why seeding is a
+  separate script, and why `--allow_inline_seeding` is off.
 
 ## 1. Two processes (there is no third — no serve)
 
@@ -247,20 +269,34 @@ data but fresh weights — the learner says so rather than pretending otherwise.
 
 ---
 
-## 6. Open items before the first live run
+## 6. Measured on 2026-09-06 (H200-5 learner, station robot, SSH tunnel)
 
-1. **The learner box needs a GPU driver.** As of 2026-09-05 `H200-5` has no NVIDIA
-   kernel module loaded and no driver package (`/dev/nvidia0` missing,
-   `lsmod | grep nvidia` empty), and `/mnt/localssd` is wiped on every restart —
-   nothing there survives, so put the checkout, the checkpoint and the dataset
-   under `$HOME`. The port is host-agnostic: the same command runs on the station's
-   5090 if the pi0.5 serve is stopped first (it holds 24.6 GB).
-2. **Measure the per-decision latency on the real link** before a long session
-   (`healthz` round trip + the agent's own decision timing log). Budget is 0.83 s;
-   the arm holds pose for whatever it costs.
-3. **Watch the first update block's VRAM.** Critic batch 64 × 20 UTD with 224²×6
-   observations plus a pi0.5 LoRA backward is the peak; `--actor_batch_size` and
-   `--utd_ratio` are the two knobs that buy it back.
-4. **`select_ratio_with_residual`** in wandb is the health metric for the edit
+| what | value |
+|---|---|
+| learner startup (cache present) | ~1.5 min: 12 GB checkpoint ×2 in 3.6 s each, 3,894 seed rows in 1.8 s, decision path compiled in ~10 s |
+| VRAM at rest | 33 GB per GPU (pi0.5 + target copy + LoRA optimizer + critic) |
+| decision, learner-side | **80-95 ms** (N=8 base + 8 edits + REDQ argmax + transforms) |
+| decision, from the station | **209 ms JPEG** / 438 ms raw — RTT is 80 ms, JPEG payload 138 KB, raw 2.9 MB. Needs the HTTP/1.1 keep-alive both sides now have; without it a fresh connection per decision cost 485 ms |
+| update block, 4 updates × UTD 20 | **22 s on 8 GPUs**, 132 s on one. First block ever: 264 s (JIT) |
+| seed cache build | 38 rollouts in 3.4 min sequential; 1.8 GB; 3,894 decisions, 929 in the success pool |
+| Ctrl+C / SIGTERM | saves a checkpoint (verified: step 8 written on kill) |
+
+Optional, needs root on the STATION: `sysctl -w net.ipv4.tcp_slow_start_after_idle=0`
+keeps the tunnel's congestion window warm between decisions (they are 833 ms
+apart, longer than one RTO) and should trim a few tens of ms more.
+
+## 7. Open items before the first live run
+
+1. **Relocate to `/mnt/localssd/Sichang`** once it exists (root-owned `/mnt`; the
+   2026-09-06 bring-up lives under `~/stage_expo` on H200-5). `EXPO_ROOT=... source
+   scripts/franka/learner_env.sh` moves everything; `uv sync` again after moving
+   the checkout. `/mnt/localssd` is NOT a separate disk right now — it is an empty
+   directory on the 886 GB root filesystem.
+2. **Start a fresh `--run_name`** for the real 100 episodes; `bringup*` runs hold a
+   few synthetic probe episodes.
+3. **`select_ratio_with_residual`** in wandb is the health metric for the edit
    policy: if the critic never picks an edited candidate, EXPO-FT has degenerated
    into best-of-N sampling from the SFT policy.
+4. **The seed rollouts were recorded at the eval session's chunking** (replan every
+   15 rows), so their executed chunks are slightly off the replan-25 cadence the
+   online run uses. Inherent to seeding; the online data is exact.

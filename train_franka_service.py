@@ -286,6 +286,22 @@ class Learner:
 
             if not self.v.rollout_seed_dir:
                 raise SystemExit("--seed_source rollouts needs --rollout_seed_dir")
+            if not self.v.allow_inline_seeding:
+                # Decoding video inside THIS process is the one configuration that
+                # bit us: by now pi0.5 is on the GPU, so the process carries a CUDA
+                # context and JAX's thread pools, and ffmpeg's decode threads on a
+                # 224-core box turned that into 1000+ threads making no progress.
+                # Build the cache in a separate, GPU-free process instead — it is
+                # also ~10x faster because it parallelises across episodes.
+                raise SystemExit(
+                    "no seed cache at "
+                    f"{cache or '(--seed_cache not set)'}. Build it first (minutes, no GPU):\n"
+                    f"  python scripts/franka/build_seed_cache.py \\\n"
+                    f"      --rollout_dir {self.v.rollout_seed_dir} \\\n"
+                    f"      --out {cache or '<path>.pkl'} --workers 12\n"
+                    "then start the learner with the same --seed_cache. Pass "
+                    "--allow_inline_seeding 1 to decode here anyway."
+                )
             return None, process_franka_rollouts(
                 self.v.rollout_seed_dir,
                 self.task,
@@ -710,6 +726,13 @@ class Learner:
 # ---------------------------------------------------------------------------
 class _Handler(http.server.BaseHTTPRequestHandler):
     learner: Learner = None  # set on the class before serve_forever
+    # HTTP/1.1 so the robot's client can keep ONE connection for the whole run.
+    # The default (HTTP/1.0) closes after every response, and a fresh connection
+    # per decision through the SSH tunnel costs a channel open plus TCP slow-start
+    # on the ~140 KB observation — measured at ~300 ms of a 485 ms decision against
+    # an 80 ms RTT, with the learner itself at ~95 ms. Every response below sets
+    # Content-Length, which HTTP/1.1 keep-alive requires.
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):  # noqa: D102 — silence per-request stderr spam
         pass
