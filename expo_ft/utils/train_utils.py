@@ -90,9 +90,18 @@ def build_pi05_config(config):
     pi05_asset_id = agent_kwargs.pop("pi05_asset_id", "") or None
     model_cls = agent_kwargs.pop("model_cls")
 
-    pi05_train_config = openpi_config.get_config(
-        pi05_config_name, weight_loader_path=pi05_weight_loader_path
-    )
+    # Upstream's openpi fork takes `weight_loader_path=` in get_config(); doing the
+    # override here instead keeps the openpi diff to what EXPO-FT actually needs
+    # (multi-sample sampling), which matters when the station's openpi branch also
+    # carries the DSRL and SubRL wire layers and has to keep merging with upstream.
+    pi05_train_config = openpi_config.get_config(pi05_config_name)
+    if pi05_weight_loader_path:
+        from openpi.training import weight_loaders as _weight_loaders  # noqa: PLC0415
+
+        pi05_train_config = dataclasses.replace(
+            pi05_train_config,
+            weight_loader=_weight_loaders.CheckpointWeightLoader(pi05_weight_loader_path),
+        )
     if pi05_assets_dir or pi05_asset_id:
         from openpi.training.config import AssetsConfig
         new_assets = AssetsConfig(

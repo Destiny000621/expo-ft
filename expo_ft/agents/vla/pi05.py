@@ -235,6 +235,7 @@ def build_pi05(config, seed, mesh, data_sharding, replicated_sharding,
     init_rng, rng = jax.random.split(rng)
     target_rng, rng = jax.random.split(rng)
 
+    use_repack = bool(agent_kwargs.pop("pi05_use_repack", True))
     actor, actor_train_state, _ = Pi05Agent.initialize(
         pi05_train_config,
         mesh,
@@ -245,6 +246,7 @@ def build_pi05(config, seed, mesh, data_sharding, replicated_sharding,
         replicated_sharding=replicated_sharding,
         freeze_pi05_encoder=freeze_encoder,
         infer_device=jax.devices()[0],
+        use_repack=use_repack,
     )
     if resume:
         target_actor_params = actor.get_params(actor_train_state)
@@ -275,8 +277,16 @@ class Pi05Agent(Model):
         infer_device: Optional[jax.Device] = None,
         action_dim: Optional[int] = None,
         state_dim: Optional[int] = None,
+        use_repack: bool = True,
     ):
 
+        # Repack maps a DATASET's key names onto the model's ("observation.images.
+        # camera1" -> "observation/image", ...). Raw observations that arrive from a
+        # robot are already in the model's naming — that is what openpi's own serving
+        # path assumes (`policy_config.create_trained_policy` passes an EMPTY repack) —
+        # so a port whose client speaks the serve wire must turn this off, or every
+        # inference dies on a missing dataset key.
+        self.use_repack = use_repack
         self.action_dim = action_dim
         self.state_dim = state_dim
         self.train_config = train_config
@@ -304,9 +314,10 @@ class Pi05Agent(Model):
 
     def _build_input_transform_pipeline(self, normalize: bool = True):
         """Compose repack, data, normalize, and model transforms for raw inputs."""
+        repack = list(self.data_config.repack_transforms.inputs) if self.use_repack else []
         if normalize:
             transforms = [
-                *self.data_config.repack_transforms.inputs,
+                *repack,
                 *self.data_config.data_transforms.inputs,
                 _transforms.Normalize(
                     self.data_config.norm_stats, use_quantiles=self.data_config.use_quantile_norm
@@ -315,7 +326,7 @@ class Pi05Agent(Model):
             ]
         else:
             transforms = [
-                *self.data_config.repack_transforms.inputs,
+                *repack,
                 *self.data_config.data_transforms.inputs,
                 *self.data_config.model_transforms.inputs,
             ]
@@ -355,6 +366,7 @@ class Pi05Agent(Model):
         default_prompt: Optional[str] = None,
         freeze_pi05_encoder: bool = False,
         infer_device: Optional[jax.Device] = None,
+        use_repack: bool = True,
     ) -> tuple["Pi05Agent", Any]:
         """Initialize a Pi05Agent instance using init_train_state."""
         train_state, train_state_sharding = pi05_init_train_state(
@@ -374,6 +386,7 @@ class Pi05Agent(Model):
             default_prompt=default_prompt,
             freeze_pi05_encoder=freeze_pi05_encoder,
             infer_device=infer_device,
+            use_repack=use_repack,
         )
         
         return agent, train_state, train_state_sharding
@@ -403,13 +416,30 @@ class Pi05Agent(Model):
         processed_inputs = _model.Observation.from_dict(transformed_inputs).to_dict()
         return processed_inputs
 
-    def process_transformed_outputs(self, transformed_actions, unnormalize=True):
-        """Unnormalize unpadded actions back to the environment action space."""
+    def process_transformed_outputs(self, transformed_actions, unnormalize=True, state=None):
+        """Unnormalize unpadded actions back to the environment action space.
+
+        `state` is the NORMALIZED, padded state the model was conditioned on — the
+        same array `Policy.infer` feeds its output transform. It matters whenever the
+        data config trains on deltas: `AbsoluteActions` re-anchors the chunk by adding
+        the (unnormalized) state back onto it, so passing zeros there yields a chunk
+        anchored at the ORIGIN instead of at the robot's current pose. Upstream's
+        DROID config uses cartesian *velocity* actions, where nothing is re-anchored
+        and the zeros are harmless; ours is delta rot6d10, where they are not.
+        Left defaulting to zeros so the DROID path is unchanged.
+        """
         n = transformed_actions.shape[0]
         padded = self._pad_actions(transformed_actions.reshape(n, -1))
-        dummy_state = np.zeros((n, self.model_config.action_dim), dtype=np.float32)
+        if state is None:
+            state_arr = np.zeros((n, self.model_config.action_dim), dtype=np.float32)
+        else:
+            state_arr = np.asarray(state, dtype=np.float32).reshape(-1, self.model_config.action_dim)
+            if state_arr.shape[0] == 1:
+                state_arr = np.repeat(state_arr, n, axis=0)
+            elif state_arr.shape[0] != n:
+                raise ValueError(f"state has {state_arr.shape[0]} rows for {n} action samples")
         output_dict = {
-            "state": dummy_state,
+            "state": state_arr,
             "actions": np.array(padded),
         }
         processed = [

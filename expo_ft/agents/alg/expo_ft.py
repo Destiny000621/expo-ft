@@ -202,6 +202,12 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     freeze_encoder: Optional[bool] = struct.field(pytree_node=False)
     freeze_critic_encoder: bool = struct.field(pytree_node=False)
     actor_success_only: bool = struct.field(pytree_node=False)
+    # Exponent on `discount` in the critic bootstrap. None = upstream behaviour
+    # (replan_steps, because one buffer transition is one ENV STEP and the target
+    # is replan_steps steps ahead). Ports whose buffer stores one transition per
+    # DECISION must set 1, and make `discount` per-decision — otherwise the agent
+    # discounts a single decision as if it were replan_steps of them.
+    discount_power: Optional[int] = struct.field(pytree_node=False, default=None)
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -261,6 +267,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         resize_size: Optional[int] = None,
         actor_success_only: bool = False,
         use_full_augmentation: bool = True,
+        discount_power: Optional[int] = None,
         **kwargs,
     ):
         action_dim = action_space.shape[-1]
@@ -449,6 +456,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             freeze_encoder=freeze_encoder,
             freeze_critic_encoder=freeze_critic_encoder,
             actor_success_only=actor_success_only,
+            discount_power=discount_power,
         )
         if not resume:
             agent = agent.cache_infer_params()
@@ -529,8 +537,12 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             train=False,
             num_samples=self.N,
         )
-        raw_actions = self.actor.process_transformed_outputs(transformed_actions)
-        
+        # Anchor the unnormalization on the state the model was conditioned on:
+        # delta-action data configs re-add it inside AbsoluteActions.
+        raw_actions = self.actor.process_transformed_outputs(
+            transformed_actions, state=transformed_inputs["state"]
+        )
+
         if only_base_actions:
             action = raw_actions[0].reshape(self.action_horizon, self.action_dim)
             sample_info = {"sample_time": sample_time, "selected_action_type": "main"}
@@ -570,7 +582,9 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
 
                 r_modified = r_samples.reshape(self.n_edit_samples, self.replan_steps, self.action_dim)
                 full_r_modified = transformed_full[:self.n_edit_samples].at[:, :self.replan_steps, :].set(r_modified)
-                raw_r_samples = self.actor.process_transformed_outputs(full_r_modified)
+                raw_r_samples = self.actor.process_transformed_outputs(
+                    full_r_modified, state=transformed_inputs["state"]
+                )
                 raw_actions = jnp.concatenate([raw_actions, raw_r_samples], axis=0)
 
             qs = compute_q(self.target_critic.apply_fn, target_params, critic_encoded_obs, transformed_actions, transformed_states, self.num_min_qs)
@@ -790,7 +804,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         next_q_nan_ratio = jnp.mean(next_q_nan_mask)
         next_qs = jnp.where(next_q_nan_mask, 0.0, next_qs)
         next_q = next_qs.min(axis=0)
-        target_q = batch["rewards"] + (self.discount ** self.replan_steps) * batch["masks"] * next_q
+        power = self.replan_steps if self.discount_power is None else self.discount_power
+        target_q = batch["rewards"] + (self.discount**power) * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
 
