@@ -552,7 +552,9 @@ class Learner:
     def _run_updates(self, num_updates: int) -> None:
         import jax  # noqa: PLC0415
 
-        for _ in range(num_updates):
+        t_block = time.perf_counter()
+        for k in range(num_updates):
+            t_upd = time.perf_counter()
             batch, actor_batch, self.combine_rng = self.batch_processor.next_batch(self.combine_rng)
             if actor_batch is None and bool(self.model_config.actor_success_only):
                 # No success episodes in the pool yet: the critic can still learn,
@@ -564,6 +566,17 @@ class Learner:
             self.agent, info = self.agent.update(self.agent, batch, int(self.v.utd_ratio), actor_batch)
             self.updates += 1
             self._log_update(info)
+            if num_updates > 1:
+                # A 20-update warm start is ~15 min of silence otherwise (the first
+                # update alone is minutes of JIT), which reads as a hang.
+                critic = info.get("critic_loss"); sel = info.get("select_ratio_with_residual")
+                logger.info(
+                    "  update %d/%d: %.1f s (%.1f min elapsed) critic_loss %s edit-selected %s",
+                    k + 1, num_updates, time.perf_counter() - t_upd,
+                    (time.perf_counter() - t_block) / 60.0,
+                    f"{float(critic):.4f}" if critic is not None else "n/a",
+                    f"{float(sel):.2f}" if sel is not None else "n/a",
+                )
 
     def compile_decision_path(self) -> None:
         """Run one throwaway decision so the robot never pays for JIT.
