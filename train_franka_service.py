@@ -230,7 +230,12 @@ class Learner:
         self._staged: dict[int, list] = {}
         self._episode_ids: list[int] = []
 
-        if self.resuming:
+        if v.resume:
+            # Rows and counters restore whenever --resume is asked for, whether or
+            # not a checkpoint exists. A run that died before its first interval
+            # save (episodes 1-4) has real robot episodes in rows/ and nothing in
+            # checkpoints/; resuming it must keep the data, and say plainly that
+            # the weights are fresh (the DSRL run lost episodes to this exact gap).
             self._restore()
 
         self.wandb = self._make_wandb()
@@ -653,6 +658,12 @@ class Learner:
             self.agent = self.agent.cache_infer_params()
             self.updates = max(steps)
             logger.info("restored agent from step %d", self.updates)
+        else:
+            logger.warning(
+                "--resume but NO checkpoint in %s: weights are the SFT init (updates=0). "
+                "Persisted episodes and counters are restored below; the first update "
+                "block retrains critic/edit policy from that buffer.", self.ckpt_dir,
+            )
         counters = os.path.join(self.run_dir, "counters.json")
         if os.path.exists(counters):
             with open(counters) as f:
@@ -660,6 +671,9 @@ class Learner:
             self.total_traj = c.get("total_traj", 0)
             self.total_env_steps = c.get("total_env_steps", 0)
             self.successes = c.get("successes", [])
+            if not steps:
+                # The counter describes WEIGHTS that no longer exist.
+                self.updates = 0
         if self.v.eval:
             # An eval restores WEIGHTS, not data: re-inserting a whole run's rows
             # costs minutes and the buffer is never read in eval mode.
