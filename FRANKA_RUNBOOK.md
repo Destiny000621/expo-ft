@@ -277,7 +277,7 @@ data but fresh weights — the learner says so rather than pretending otherwise.
 | VRAM at rest | 33 GB per GPU (pi0.5 + target copy + LoRA optimizer + critic) |
 | decision, learner-side | **80-95 ms** (N=8 base + 8 edits + REDQ argmax + transforms) |
 | decision, from the station | **209 ms JPEG** / 438 ms raw — RTT is 80 ms, JPEG payload 138 KB, raw 2.9 MB. Needs the HTTP/1.1 keep-alive both sides now have; without it a fresh connection per decision cost 485 ms |
-| update block, 4 updates × UTD 20 | **22 s on 8 GPUs**, 132 s on one. First block ever: 264 s (JIT) |
+| update block, 4 updates × UTD 20 | **38 s on 4 GPUs** (the budget on this shared box); 22 s on 8, 132 s on one. First block ever: ~270 s (JIT) |
 | seed cache build | 38 rollouts in 3.4 min sequential; 1.8 GB; 3,894 decisions, 929 in the success pool |
 | Ctrl+C / SIGTERM | saves a checkpoint (verified: step 8 written on kill) |
 
@@ -287,11 +287,16 @@ apart, longer than one RTO) and should trim a few tens of ms more.
 
 ## 7. Open items before the first live run
 
-1. **Relocate to `/mnt/localssd/Sichang`** once it exists (root-owned `/mnt`; the
-   2026-09-06 bring-up lives under `~/stage_expo` on H200-5). `EXPO_ROOT=... source
-   scripts/franka/learner_env.sh` moves everything; `uv sync` again after moving
-   the checkout. `/mnt/localssd` is NOT a separate disk right now — it is an empty
-   directory on the 886 GB root filesystem.
+1. **H200-5 layout is final at `/mnt/localssd/Sichang`** (done 2026-09-06): `code/expo_ft`
+   is a checkout of `Destiny000621/expo-ft:franka-port` with openpi
+   `Destiny000621/openpi:Franka_EXPO` under `expo_ft/agents/vla/openpi`; the SFT
+   checkpoint sits in `home_migrated/physical/.cache/openpi/hf/` (which is where
+   `~/.cache/openpi` points, so the TrainConfig's HOME-relative default resolves);
+   `seed/`, `logs/expo_franka/` (incl. `seed_rows.pkl`), and `run_remote.sh`. Launch:
+   `bash /mnt/localssd/Sichang/run_remote.sh <log> <cmd...>`. **Use GPUs 0-3 only**
+   (`learner_env.sh` default) — the box is shared. `/mnt/localssd` is not a separate
+   disk at the moment (a directory on the 886 GB root fs), and `~/.profile` still
+   sources a missing `/mnt/localssd/Sichang/env`, so use non-login shells.
 2. **Start a fresh `--run_name`** for the real 100 episodes; `bringup*` runs hold a
    few synthetic probe episodes.
 3. **`select_ratio_with_residual`** in wandb is the health metric for the edit
