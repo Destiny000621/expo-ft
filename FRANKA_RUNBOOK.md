@@ -158,7 +158,7 @@ cd ~/Desktop/expo_ft && bash scripts/franka/run_franka.sh
 # 2) if the learner is on another machine, forward its port FROM the robot box —
 #    WITH keepalives (a silently dead tunnel still accepts connections and hangs):
 ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
-    -L 9112:localhost:9112 <learner-host>
+    -L 9112:localhost:9112 <learner-host>      # on this station: physical-h200-5 (gcloud IAP)
 curl -s localhost:9112/healthz      # must answer before the robot session starts
 
 # 3) robot loop (station)
