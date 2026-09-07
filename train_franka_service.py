@@ -128,6 +128,7 @@ class Learner:
             logger.info("run dir %s exists but holds no checkpoint, rows or counters — "
                         "treating it as fresh", self.run_dir)
             overwrite = True
+        self._purge_stale_tmp_checkpoints()
         self.checkpoint_manager, resuming = initialize_checkpoint_dir(
             epath.Path(self.ckpt_dir), keep_period=v.keep_period, overwrite=overwrite, resume=v.resume
         )
@@ -266,6 +267,18 @@ class Learner:
     # ------------------------------------------------------------------
     # setup helpers
     # ------------------------------------------------------------------
+    def _purge_stale_tmp_checkpoints(self) -> None:
+        """Remove `*orbax-checkpoint-tmp*` leftovers from a save that never finalized."""
+        import shutil  # noqa: PLC0415
+
+        if not os.path.isdir(self.ckpt_dir):
+            return
+        for name in os.listdir(self.ckpt_dir):
+            if "orbax-checkpoint-tmp" in name:
+                logger.warning("removing unfinished checkpoint %s (the save that wrote it "
+                               "did not finalize)", name)
+                shutil.rmtree(os.path.join(self.ckpt_dir, name), ignore_errors=True)
+
     def _run_dir_is_empty(self) -> bool:
         if not os.path.isdir(self.ckpt_dir):
             return True
@@ -701,6 +714,12 @@ class Learner:
             return out
         try:
             save_checkpoint(self.checkpoint_manager, self.agent, self.updates)
+            # orbax saves ASYNCHRONOUSLY: save_checkpoint returns after the blocking
+            # host copy (~9 s) while a background thread still writes and then
+            # renames the *-tmp-* directory into place. The signal handler calls
+            # os._exit right after this method, so without waiting the process dies
+            # with only the tmp dir on disk — which resume ignores. Wait here.
+            self.checkpoint_manager.wait_until_finished()
             out["checkpoint"] = f"{self.ckpt_dir}@{self.updates}"
         except Exception as exc:  # noqa: BLE001
             logger.error("checkpoint NOT saved (%s)", exc)
@@ -849,8 +868,14 @@ def main(v) -> None:
     learner.run_initial_updates()
 
     def _bye(signum, _frame):
-        logger.warning("signal %s — saving before exit", signum)
+        staged = sum(len(v) for v in learner._staged.values())  # noqa: SLF001
+        logger.warning(
+            "signal %s — saving before exit%s", signum,
+            f" ({staged} staged decisions of an OPEN episode are dropped: no label, no reward)"
+            if staged else "",
+        )
         learner.save(f"signal-{signum}")
+        logger.warning("exit. Resume with: --resume 1 --run_name %s", learner.v.run_name)
         os._exit(0)
 
     signal.signal(signal.SIGINT, _bye)
