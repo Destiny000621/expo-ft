@@ -403,6 +403,14 @@ class Learner:
             resume="allow",
             id=self.v.run_name,
         )
+        # `updates` is the x-axis, declared as a step METRIC rather than passed as
+        # wandb's global step: a resumed run whose checkpoint did not survive
+        # restarts `updates` at 0 while the wandb run already holds later steps, and
+        # wandb silently DROPS every point logged to a lower global step (live
+        # 2026-09-07: a whole 20-update warm start vanished from the curves).
+        wandb.define_metric("updates")
+        wandb.define_metric("training/*", step_metric="updates")
+        wandb.define_metric("episode/*", step_metric="updates")
         return wandb
 
     # ------------------------------------------------------------------
@@ -748,29 +756,29 @@ class Learner:
     def _log_update(self, info) -> None:
         if self.wandb is None:
             return
-        flat = {}
+        flat = {"updates": self.updates}
         for k, val in info.items():
             val = self.jax.device_get(val)
             if getattr(val, "ndim", 0) == 0:
                 flat[f"training/{k}"] = float(val)
-        self.wandb.log(flat, step=self.updates)
+        self.wandb.log(flat)
 
     def _log_episode(self, is_success: bool) -> None:
         if self.wandb is None:
             return
         self.wandb.log(
             {
-                "is_success": int(bool(is_success)),
-                "total_num_traj": self.total_traj,
-                "env_steps": self.total_env_steps,
-                "replay_buffer_size": len(self.replay),
-                "episode_reward": float(bool(is_success)),
+                "updates": self.updates,
+                "episode/is_success": int(bool(is_success)),
+                "episode/total_num_traj": self.total_traj,
+                "episode/env_steps": self.total_env_steps,
+                "episode/replay_buffer_size": len(self.replay),
+                "episode/episode_reward": float(bool(is_success)),
                 # Parity aliases with the DSRL and SubRL learners so all three
                 # baselines can be read off one dashboard.
-                "success_rate_10": float(np.mean(self.successes[-10:])),
-                "success_rate_20": float(np.mean(self.successes[-20:])),
-            },
-            step=self.updates,
+                "episode/success_rate_10": float(np.mean(self.successes[-10:])),
+                "episode/success_rate_20": float(np.mean(self.successes[-20:])),
+            }
         )
 
     def health(self) -> dict:
