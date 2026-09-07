@@ -251,9 +251,12 @@ right-wrist slot pi0.5 pads with is stored too, upstream's layout), so a full ru
 ## 4. Evaluation
 
 ```bash
-EVAL_BASE_ONLY=0 bash scripts/franka/run_eval.sh          # the trained policy
-EVAL_BASE_ONLY=1 bash scripts/franka/run_eval.sh          # frozen-pi0.5 baseline row
-# robot side:
+# learner box, same shell setup as training; needs a checkpoint of the run
+# (Ctrl+C the training learner first, or any 5-episode interval checkpoint):
+cd /mnt/localssd/Sichang/code/expo_ft && source scripts/franka/learner_env.sh
+RUN=<trained run> bash scripts/franka/run_eval.sh                    # the trained policy
+RUN=<trained run> EVAL_BASE_ONLY=1 bash scripts/franka/run_eval.sh   # frozen-pi0.5 baseline row
+# robot side (tunnel up):
 python -m avantbot.collect --config policy/franka_pi05_ee_fr3_expo_eval
 ```
 
