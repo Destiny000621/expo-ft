@@ -139,6 +139,24 @@ def load_agent(seed, example_observation, example_action, example_state,
     )
     return EXPOLearner.create(seed, example_observation, example_action, example_state, **agent_kwargs)
 
+def _parse_residual_dims(spec: str, action_dim: int) -> tuple:
+    """'xyz' | 'xyz_rot' | 'all' | comma-separated indices -> editable action dims.
+
+    Named specs assume the rot6d10 layout [x, y, z, r6_0..r6_5, gripper].
+    """
+    spec = spec.strip().lower()
+    if spec == "all":
+        return tuple(range(action_dim))
+    if spec == "xyz":
+        return (0, 1, 2)
+    if spec == "xyz_rot":
+        return tuple(range(min(9, action_dim)))
+    dims = tuple(sorted({int(x) for x in spec.split(",") if x.strip()}))
+    if not dims or min(dims) < 0 or max(dims) >= action_dim:
+        raise ValueError(f"residual_action_dims {spec!r} is not valid for action_dim={action_dim}")
+    return dims
+
+
 def decay_mask_fn(params):
     flat_params = flax.traverse_util.flatten_dict(params)
     flat_mask = {path: path[-1] != "bias" for path in flat_params}
@@ -208,6 +226,21 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
     # DECISION must set 1, and make `discount` per-decision — otherwise the agent
     # discounts a single decision as if it were replan_steps of them.
     discount_power: Optional[int] = struct.field(pytree_node=False, default=None)
+    # How the edit policy's sample becomes a residual over the replan chunk.
+    #   "per_step"     upstream: one independent value per row and dim
+    #                  (full_action_dim outputs). Right for DROID's cartesian
+    #                  VELOCITY actions, where each row is a small independent step.
+    #   "chunk_offset" one action_dim-sized offset broadcast over every row of the
+    #                  chunk. Right for ABSOLUTE position chunks executed at 30 Hz:
+    #                  per-row noise there is a target that teleports every tick
+    #                  (measured live: 30-40 mm/row against the base policy's
+    #                  0.4 mm/row), while a per-chunk offset keeps the base sample's
+    #                  shape and shifts where it goes — the edit an insertion needs.
+    residual_mode: str = struct.field(pytree_node=False, default="per_step")
+    # Action dims the residual may touch (static tuple; () = all). rot6d entries
+    # edited independently stop being a rotation, and a gripper edit is an
+    # out-of-distribution lever — both are excluded on the Franka task.
+    residual_dims: tuple = struct.field(pytree_node=False, default=())
     _infer_cache: Optional[dict] = struct.field(pytree_node=False, default=None)
 
     @classmethod
@@ -268,6 +301,8 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         actor_success_only: bool = False,
         use_full_augmentation: bool = True,
         discount_power: Optional[int] = None,
+        residual_mode: str = "per_step",
+        residual_action_dims: Optional[str] = None,
         **kwargs,
     ):
         action_dim = action_space.shape[-1]
@@ -280,11 +315,26 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         print("residual actor output size / q function input size: ", full_action_dim, " (replan_steps=", replan_steps, "* action_dim=", action_dim, ")")
         print("states shape: ", states.shape)
 
+        if residual_mode not in ("per_step", "chunk_offset"):
+            raise ValueError(f"residual_mode must be 'per_step' or 'chunk_offset', got {residual_mode!r}")
+        if residual_action_dims:
+            residual_dims = _parse_residual_dims(residual_action_dims, action_dim)
+        elif residual_action_xyzg:
+            # upstream's mask: xyz and the gripper (last dim), no rotation
+            residual_dims = tuple(range(3)) + (action_dim - 1,)
+        else:
+            residual_dims = tuple(range(action_dim))
+        # The edit policy's OUTPUT size — the entropy target and the log-prob
+        # correction below must be sized to it, not to the chunk.
+        residual_dim = action_dim if residual_mode == "chunk_offset" else full_action_dim
+        print("residual mode:", residual_mode, "| residual output size:", residual_dim,
+              "| editable dims:", residual_dims)
+
         if target_entropy is None:
             if adjust_target_entropy:
-                target_entropy = -full_action_dim / 2 + full_action_dim * jnp.log(edit_scale)
+                target_entropy = -residual_dim / 2 + residual_dim * jnp.log(edit_scale)
             else:
-                target_entropy = -full_action_dim / 2
+                target_entropy = -residual_dim / 2
 
         rng = jax.random.PRNGKey(seed)
         rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
@@ -328,7 +378,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         residual_actor_base_cls = partial(
             MLP, hidden_dims=hidden_dims, dropout_rate=actor_drop, activate_final=True, use_pnorm=use_pnorm
         )
-        residual_actor_cls= TanhNormal(residual_actor_base_cls, full_action_dim)
+        residual_actor_cls = TanhNormal(residual_actor_base_cls, residual_dim)
         residual_actor_def = PixelEditMultiplexer(
             network_cls=residual_actor_cls,
             latent_dim=latent_dim_state,
@@ -457,19 +507,29 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             freeze_critic_encoder=freeze_critic_encoder,
             actor_success_only=actor_success_only,
             discount_power=discount_power,
+            residual_mode=residual_mode,
+            residual_dims=tuple(int(d) for d in residual_dims),
         )
         if not resume:
             agent = agent.cache_infer_params()
         return agent
 
-    def _apply_residual_xyzg_mask(self, residual: jnp.ndarray) -> jnp.ndarray:
-        """Zero out rotation dims (3,4,5) when residual_action_xyzg is True. Keeps xyz (0,1,2) and gripper (6)."""
-        if not self.residual_action_xyzg:
-            return residual
-        # mask: 1 for xyz (0,1,2) and gripper (last dim), 0 for rotation (3,4,5)
-        mask = jnp.ones(self.action_dim).at[3:6].set(0.0)
-        full_mask = jnp.tile(mask, self.replan_steps)
-        return residual * full_mask
+    def _expand_residual(self, residual: jnp.ndarray) -> jnp.ndarray:
+        """Edit-policy sample -> (B, full_action_dim) residual over the replan chunk.
+
+        Applies the editable-dim mask, and in "chunk_offset" mode broadcasts the
+        single per-chunk offset over every row. Upstream's `residual_action_xyzg`
+        is the special case residual_dims == (0, 1, 2, action_dim-1) in "per_step".
+        """
+        dims = self.residual_dims or tuple(range(self.action_dim))
+        mask = jnp.zeros((self.action_dim,)).at[jnp.asarray(dims)].set(1.0)
+        if self.residual_mode == "chunk_offset":
+            per_row = residual.reshape(-1, 1, self.action_dim) * mask
+            return jnp.broadcast_to(
+                per_row, (per_row.shape[0], self.replan_steps, self.action_dim)
+            ).reshape(-1, self.full_action_dim)
+        per_row = residual.reshape(-1, self.replan_steps, self.action_dim) * mask
+        return per_row.reshape(-1, self.full_action_dim)
 
     def cache_infer_params(self):
         """Copy params onto infer_sharding for rollout sampling.
@@ -489,7 +549,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
         r_samples, rng = _sample_actions(
             key, self.residual_actor.apply_fn, residual_params, encoded_obs, states, base_actions
         )
-        residual_scaled = self._apply_residual_xyzg_mask(r_samples * self.edit_scale)
+        residual_scaled = self._expand_residual(r_samples) * self.edit_scale
         combined = residual_scaled + base_actions
         return combined, residual_scaled, rng
 
@@ -709,7 +769,7 @@ class EXPOLearner(AgentLearner, struct.PyTreeNode):
             actions = dist.sample(seed=key)
 
             log_probs = dist.log_prob(actions)
-            residual_scaled = self._apply_residual_xyzg_mask(actions * self.edit_scale)
+            residual_scaled = self._expand_residual(actions) * self.edit_scale
             # Subtract log of action scale for each action dimension
             log_probs -= actions.shape[-1] * jnp.log(self.edit_scale)
 

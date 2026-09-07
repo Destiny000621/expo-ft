@@ -36,7 +36,19 @@ def get_config():
     # scale 0.2 in NORMALIZED action space (the README's recommended starting point).
     config.N = 8
     config.n_edit_samples = 8
-    config.edit_scale = 0.2
+    # One xyz offset per CHUNK, not one value per row and dim. Upstream's
+    # per-row residual is right for DROID's cartesian velocities and wrong for
+    # absolute 30 Hz position chunks — measured live on 2026-09-06: edited chunks
+    # stepped 30-40 mm per row (the base policy: 0.4 mm), rot6d entries left the
+    # unit sphere by 0.2, and the gripper jumped 0.8 rad within a chunk. A per-chunk
+    # xyz offset keeps the base sample's shape and moves where it goes, which is
+    # the edit a plug-into-port task can use.
+    config.residual_mode = "chunk_offset"
+    config.residual_action_dims = "xyz"
+    # tanh-bounded, in NORMALIZED action units: 0.1 x the ~0.05 m half-span of the
+    # xyz delta stats = up to ~5 mm of offset per axis per chunk. Upstream's 0.2
+    # doubles that; raise it once the critic ranks candidates sensibly.
+    config.edit_scale = 0.1
     config.actor_success_only = True
 
     # --- discounting --------------------------------------------------------

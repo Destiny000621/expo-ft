@@ -362,7 +362,9 @@ def test_learner_networks_build_with_the_right_shapes(pi05_config, task, model_c
     assert agent.replan_steps == task.replan_steps
     assert agent.discount_power == 1 and agent.discount == pytest.approx(0.99)
     assert agent.N == 8 and agent.n_edit_samples == 8
-    assert agent.target_entropy == pytest.approx(-agent.full_action_dim / 2)
+    # The edit policy emits ONE offset per chunk (chunk_offset), so its entropy
+    # target is sized to action_dim, not to the 250-wide chunk the critic scores.
+    assert agent.target_entropy == pytest.approx(-task.action_dim / 2)
 
 
 # ---------------------------------------------------------- rollout seeding
@@ -558,3 +560,69 @@ def test_live_observation_survives_the_input_pipeline(pi05_config, task, model_c
     # Zero normalized actions do NOT decode to zero: they unnormalize and then get
     # the current pose added back, so the chunk must land near the robot.
     assert np.linalg.norm(out[0, 0, :3] - state[:3]) < 0.5
+
+
+def test_chunk_offset_residual_keeps_the_chunk_smooth(pi05_config, task, model_cfg):
+    """The edit must shift a chunk, not shred it.
+
+    Upstream's per-row residual, applied to absolute 30 Hz position chunks, produced
+    targets that stepped 30-40 mm per row (live, 2026-09-06). With "chunk_offset"
+    + xyz-only, an edited chunk is the base chunk plus ONE constant xyz offset:
+    identical row-to-row motion, untouched rotation and gripper.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    import openpi.training.sharding as sh
+    from expo_ft.agents.alg.expo_ft import load_agent
+    from expo_ft.utils.train_utils import build_pi05_config
+
+    agent_kwargs, _, _, _ = build_pi05_config(dict(model_cfg))
+    freeze = agent_kwargs.pop("freeze_pi05_encoder")
+    agent_kwargs.pop("pi05_use_repack", None)
+    _mesh = sh.make_mesh(1)
+    data_sharding = jax.sharding.NamedSharding(_mesh, jax.sharding.PartitionSpec(sh.DATA_AXIS))
+    replicated = jax.sharding.NamedSharding(_mesh, jax.sharding.PartitionSpec())
+    buf = _buffer(pi05_config, task, capacity=4)
+    obs, state, act = buf.convert_to_critic_format(
+        {k: buf.dataset_dict[k][0] for k in ("base_image", "left_wrist_image", "state", "actions")}
+    )
+
+    class _StubActor:
+        infer_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        model_config = pi05_config.model
+        mesh = _mesh
+        action_dim = task.action_dim
+        state_dim = pi05_config.model.action_dim
+
+    agent = load_agent(
+        seed=0, example_observation=obs, example_action=act, example_state=state,
+        actor=_StubActor(), actor_train_state=None, target_actor_params=None,
+        agent_kwargs=agent_kwargs,
+        metadata=dict(action_horizon=task.action_horizon, resize_size=224, freeze_encoder=freeze),
+        mesh=_mesh, data_sharding=data_sharding, replicated_sharding=replicated, resume=True,
+        replan_steps=task.replan_steps, default_prompt=task.language_instruction,
+        residual_action_xyzg=task.residual_action_xyzg,
+    )
+    assert agent.residual_mode == "chunk_offset"
+    assert agent.residual_dims == (0, 1, 2)
+    # The edit policy outputs ONE action_dim vector, and the entropy target is sized to it.
+    assert agent.target_entropy == pytest.approx(-task.action_dim / 2)
+
+    r = jnp.asarray(np.array([[1.0, -0.5, 0.25, 9, 9, 9, 9, 9, 9, 9]], np.float32))  # rot/grip = poison
+    expanded = np.asarray(agent._expand_residual(r)).reshape(task.replan_steps, task.action_dim)
+    np.testing.assert_allclose(expanded[:, :3], np.tile([[1.0, -0.5, 0.25]], (task.replan_steps, 1)))
+    assert np.all(expanded[:, 3:] == 0.0), "rot6d / gripper must be untouched by the edit"
+    # constant across rows -> the residual adds no row-to-row motion at all
+    assert np.abs(np.diff(expanded, axis=0)).max() == 0.0
+
+    # And a sampled edit through the real distribution has the same shape.
+    key = jax.random.PRNGKey(0)
+    dist = agent.residual_actor.apply_fn(
+        {"params": agent.residual_actor.params},
+        jnp.ones((2, agent_kwargs["latent_dim_image"])),
+        actions=jnp.zeros((2, agent.full_action_dim)),
+        p=jnp.zeros((2, pi05_config.model.action_dim)),
+    )
+    sample = dist.sample(seed=key)
+    assert sample.shape == (2, task.action_dim)

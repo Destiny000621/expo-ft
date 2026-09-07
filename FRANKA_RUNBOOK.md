@@ -213,7 +213,9 @@ Upstream's values unless the "why" column says otherwise.
 | knob | value | why |
 |---|---|---|
 | `N` / `n_edit_samples` | **8 / 8** | upstream; 16 candidates scored per decision |
-| `edit_scale` | **0.2** | upstream's recommended starting point, in NORMALIZED action space |
+| `residual_mode` | **chunk_offset** | ONE offset per chunk, broadcast over the 25 rows. Upstream's per-row residual is right for DROID's cartesian *velocities* and wrong for absolute 30 Hz *position* chunks — live 2026-09-06: edited chunks stepped 30-40 mm per row (base policy 0.4 mm/row), rot6d left the unit sphere by 0.2, gripper jumped 0.8 rad inside a chunk. The offset keeps the base sample's shape and moves where it goes |
+| `residual_action_dims` | **xyz** | no rot6d edits (independently edited entries are not a rotation) and no gripper edits (an out-of-distribution lever). Upstream's `residual_action_xyzg` is the DROID special case |
+| `edit_scale` | **0.1** | tanh-bounded, NORMALIZED units: ≈ up to 5 mm of xyz offset per axis per chunk. Upstream's 0.2 doubles that; raise once the critic ranks candidates sensibly |
 | `replan_steps` | **25** | half of pi0.5's 50-row chunk = 0.83 s. Upstream replans at half its horizon too (8 of 16). Must equal the session's `open_loop_horizon` |
 | `residual_action_xyzg` | **False** | upstream's pick task disables rotation edits; an RJ45 insertion is exactly where wrist alignment decides the episode |
 | `discount` | **0.99 per DECISION** | horizon ≈ 100 decisions ≈ one episode. Upstream's 0.99 per 10 Hz env step would be 0.78 per decision here — blind to the only reward the task has |
@@ -305,6 +307,11 @@ apart, longer than one RTO) and should trim a few tens of ms more.
 3. **`select_ratio_with_residual`** in wandb is the health metric for the edit
    policy: if the critic never picks an edited candidate, EXPO-FT has degenerated
    into best-of-N sampling from the SFT policy.
-4. **The seed rollouts were recorded at the eval session's chunking** (replan every
+4. **Do not run the first episodes on a random critic.** With `updates == 0`
+   the argmax over 16 candidates is a coin flip, and the live run picked an
+   edited (noisier) candidate 10 times in 14. `--initial_updates N` pre-trains
+   the critic on the seeded rollouts before the robot connects (≈ 38 s per update
+   on 4 GPUs); 20-30 is a sensible warm start and is NOT upstream behaviour.
+5. **The seed rollouts were recorded at the eval session's chunking** (replan every
    15 rows), so their executed chunks are slightly off the replan-25 cadence the
    online run uses. Inherent to seeding; the online data is exact.
