@@ -119,8 +119,17 @@ class Learner:
         self.ckpt_dir = os.path.join(self.run_dir, "checkpoints")
         self.rows_dir = os.path.join(self.run_dir, "rows")
         os.makedirs(self.rows_dir, exist_ok=True)
+        overwrite = bool(v.overwrite)
+        if not overwrite and not v.resume and self._run_dir_is_empty():
+            # Upstream refuses ANY existing checkpoint dir. A run that died before
+            # its first save (a missing seed cache, a wandb prompt, a typo) leaves an
+            # empty one behind, and then the corrected relaunch fails on the
+            # leftover. An empty run dir has nothing to protect.
+            logger.info("run dir %s exists but holds no checkpoint, rows or counters — "
+                        "treating it as fresh", self.run_dir)
+            overwrite = True
         self.checkpoint_manager, resuming = initialize_checkpoint_dir(
-            epath.Path(self.ckpt_dir), keep_period=v.keep_period, overwrite=v.overwrite, resume=v.resume
+            epath.Path(self.ckpt_dir), keep_period=v.keep_period, overwrite=overwrite, resume=v.resume
         )
         self.resuming = bool(resuming)
 
@@ -252,6 +261,14 @@ class Learner:
     # ------------------------------------------------------------------
     # setup helpers
     # ------------------------------------------------------------------
+    def _run_dir_is_empty(self) -> bool:
+        if not os.path.isdir(self.ckpt_dir):
+            return True
+        has_ckpt = any(name.isdigit() for name in os.listdir(self.ckpt_dir))
+        has_rows = any(name.endswith(".pkl") for name in os.listdir(self.rows_dir))
+        has_counters = os.path.exists(os.path.join(self.run_dir, "counters.json"))
+        return not (has_ckpt or has_rows or has_counters)
+
     def _seed_source(self):
         """Return (preprocessed_rows | None, transition_iterable | None).
 
