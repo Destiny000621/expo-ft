@@ -19,6 +19,13 @@ source .venv/bin/activate
 
 EXP=${EXP:-$(pwd)/logs/expo_franka}
 RUN=${RUN:-expo_franka_cable_seed0}
+# The seed cache is named after what went into it, so a success-only run can
+# never silently pick up a cache that also holds failures (or vice versa).
+#   INCLUDE_FAILURES=0 (default, upstream-faithful) -> seed_rows_success.pkl
+#   INCLUDE_FAILURES=1                                -> seed_rows_all.pkl
+# Build it first:  python scripts/franka/build_seed_cache.py --rollout_dir $ROLLOUT_DIR \
+#                    --include_failures $INCLUDE_FAILURES --out $EXP/seed_rows_<tag>.pkl
+if [ "${INCLUDE_FAILURES:-0}" = "0" ]; then SEED_TAG=success; else SEED_TAG=all; fi
 
 python -m launch_train_franka \
     --config configs/model/expo_ft_franka_config.py \
@@ -28,9 +35,9 @@ python -m launch_train_franka \
     --run_name "$RUN" \
     --seed_source "${SEED_SOURCE:-rollouts}" \
     --rollout_seed_dir "${ROLLOUT_DIR:-$HOME/expo_seed/data_log_eval_wcrop}" \
-    --rollout_include_failures "${INCLUDE_FAILURES:-1}" \
+    --rollout_include_failures "${INCLUDE_FAILURES:-0}" \
     --num_data "${NUM_DATA:-0}" \
-    --seed_cache "$EXP/seed_rows.pkl" \
+    --seed_cache "$EXP/seed_rows_${SEED_TAG}.pkl" \
     --batch_size 64 \
     --actor_batch_size 16 \
     --utd_ratio 20 \

@@ -76,6 +76,12 @@ give a critic, and the signal the online run would otherwise buy with robot time
 Successes are what the actor learns from: the BC pool is success-only by config, so
 nothing distils toward a failed rollout.
 
+**Default is success-only** (`INCLUDE_FAILURES=0`, cache `seed_rows_success.pkl`),
+matching upstream, which seeds from its `success/` demo directory. Failures can
+be added as critic-only data (`INCLUDE_FAILURES=1`, cache `seed_rows_all.pkl`); on
+this set they are 3:1 the majority by decisions because they run long. The two
+caches are named apart so a run can never pick up the wrong one.
+
 As of 2026-09-06 that directory holds **38 episodes, 15 of them successes**
 (`metadata.json: success` and a `SUCCESS` marker file agree on every one).
 
@@ -226,10 +232,10 @@ Upstream's values unless the "why" column says otherwise.
 | `actor_batch_size` | **16** | the actor step is a pi0.5 backward pass; upstream ran both at 64 on 4 GPUs |
 | `use_full_augmentation` | **False** (crop only) | rotate/colour-jitter fights a checkpoint trained on a fixed wrist crop |
 | `seed_source` | **rollouts** | `data_log_eval_wcrop`, seeded at decision stride into the online buffer (upstream's `offline_ratio=0` path) |
-| `rollout_include_failures` | **1** | recorded failures are critic data (rewards 0, terminal); the actor's BC pool stays success-only |
-| `num_data` | **0 = all** | 38 rollout episodes -> roughly 1.7k seeded decisions |
+| `rollout_include_failures` | **0** | success-only, as upstream seeds from success demos (user decision 2026-09-07). 1 adds the 23 recorded failures as critic-only data — 76% of the critic's seed would be failure |
+| `num_data` | **0 = all** | 15 success rollouts -> 929 seeded decisions (all in the actor's BC pool) |
 | `min_episodes_before_update` | **1** | upstream waits for 10 collected episodes; with the demos seeded there is something to learn from at once, and robot episodes are the scarce resource |
-| `buffer_capacity` | **20,000** | ~1.7k seeded + 100 × ~108 ≈ 12.5k. The buffer is a ring: undersize it and it eats its own seed |
+| `buffer_capacity` | **20,000** | ~0.9k seeded + 100 × ~108 ≈ 11.7k. The buffer is a ring: undersize it and it eats its own seed |
 | `max_episode_steps` | **2700** (90 s) | the 100 demos average 38.4 s; same cap as DSRL |
 
 **The budget is 100 online robot episodes** (`--num_episodes 100`, the same as the

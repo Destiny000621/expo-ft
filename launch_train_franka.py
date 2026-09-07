@@ -50,7 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed_source", choices=["rollouts", "lerobot", "none"], default="rollouts")
     p.add_argument("--rollout_seed_dir", default="",
                    help="recorder directory of pi0.5 rollouts (e.g. data_log_eval_wcrop)")
-    p.add_argument("--rollout_include_failures", type=int, default=1,
+    # 0 = upstream-faithful: EXPO-FT seeds from success demos only (user decision
+    # 2026-09-07). 1 adds failed rollouts as critic-only data (rewards 0, terminal);
+    # the actor's BC pool is success-only either way.
+    p.add_argument("--rollout_include_failures", type=int, default=0,
                    help="also seed failed rollouts as critic data (rewards 0, terminal). "
                         "The actor's BC pool stays success-only regardless")
     p.add_argument("--num_data", type=int, default=0,
