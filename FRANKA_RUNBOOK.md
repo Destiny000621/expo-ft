@@ -270,7 +270,16 @@ random critic.
 * `counters.json` — episode/update/success counters.
 
 `--resume 1` restores all three. Restoring rows without a checkpoint gives you the
-data but fresh weights — the learner says so rather than pretending otherwise.
+data but fresh weights — the learner says so rather than pretending otherwise
+(add `--initial_updates N` to re-warm the critic in that case).
+
+**Ctrl+C / SIGTERM saves the latest checkpoint** — verified 2026-09-07: SIGINT →
+save → wait for orbax's finalize thread → `checkpoints/<updates>/` on disk →
+exit in ~17 s; `--resume 1` then logs `restored agent from step <updates>` and
+answers decisions. Before that fix the handler exited during the async write and
+left only a `*-orbax-checkpoint-tmp-*` dir, which resume ignores (both first-day
+shutdown saves were lost that way). Decisions of an episode that is still OPEN at
+Ctrl+C are dropped — they have no label — and the handler says how many.
 
 ---
 
