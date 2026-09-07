@@ -285,6 +285,8 @@ data but fresh weights — the learner says so rather than pretending otherwise.
 | update block, 4 updates × UTD 20 | **38 s on 4 GPUs** (the budget on this shared box); 22 s on 8, 132 s on one. First block ever: ~270 s (JIT) |
 | seed cache build | 38 rollouts in 3.4 min sequential; 1.8 GB; 3,894 decisions, 929 in the success pool |
 | Ctrl+C / SIGTERM | saves a checkpoint (verified: step 8 written on kill) |
+| chunk smoothness, same fixed observation ×14 | per-row residual (upstream): **4/14 smooth**, edited chunks 30-40 mm/row; chunk-offset xyz @ 0.1: **14/14 smooth**, 0.3-0.7 mm/row = the serve's own base chunks |
+| 20-update offline warm start | 411 s on 4 GPUs (first update is the JIT; the rest ~7 s each) |
 
 Optional, needs root on the STATION: `sysctl -w net.ipv4.tcp_slow_start_after_idle=0`
 keeps the tunnel's congestion window warm between decisions (they are 833 ms
