@@ -298,7 +298,7 @@ class Learner:
                     f"{cache or '(--seed_cache not set)'}. Build it first (minutes, no GPU):\n"
                     f"  python scripts/franka/build_seed_cache.py \\\n"
                     f"      --rollout_dir {self.v.rollout_seed_dir} \\\n"
-                    f"      --out {cache or '<path>.pkl'} --workers 12\n"
+                    f"      --out {cache or '<path>.pkl'}\n"
                     "then start the learner with the same --seed_cache. Pass "
                     "--allow_inline_seeding 1 to decode here anyway."
                 )

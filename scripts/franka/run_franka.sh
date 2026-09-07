@@ -30,7 +30,7 @@ python -m launch_train_franka \
     --rollout_seed_dir "${ROLLOUT_DIR:-$HOME/expo_seed/data_log_eval_wcrop}" \
     --rollout_include_failures "${INCLUDE_FAILURES:-1}" \
     --num_data "${NUM_DATA:-0}" \
-    --seed_cache "$EXP/seed_cache.pkl" \
+    --seed_cache "$EXP/seed_rows.pkl" \
     --batch_size 64 \
     --actor_batch_size 16 \
     --utd_ratio 20 \
