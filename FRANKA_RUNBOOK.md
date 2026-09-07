@@ -149,8 +149,11 @@ Three things on that box that look like bugs and are not:
 # 1) learner (learner box; owns pi0.5, the critic and the edit policy)
 cd ~/Desktop/expo_ft && bash scripts/franka/run_franka.sh
 
-# 2) if the learner is on another machine, forward its port FROM the robot box:
-ssh -N -L 9112:localhost:9112 <learner-host>
+# 2) if the learner is on another machine, forward its port FROM the robot box —
+#    WITH keepalives (a silently dead tunnel still accepts connections and hangs):
+ssh -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+    -L 9112:localhost:9112 <learner-host>
+curl -s localhost:9112/healthz      # must answer before the robot session starts
 
 # 3) robot loop (station)
 cd ~/Desktop/Haply_Franka/vendor/avantbot && pixi shell -e droid-openpi
