@@ -417,9 +417,12 @@ class Learner:
 
             dt_ms = (time.perf_counter() - t0) * 1000.0
             if step_id % 10 == 0:
+                # Not logging info["sample_time"]: it is a time.monotonic() delta taken
+                # INSIDE a jitted function, i.e. a constant frozen at trace time
+                # (~1.1 s), which misreads as a slow policy. dt_ms is the real cost.
                 logger.info(
-                    "ep %d decision %d: %.0f ms (sample %.0f ms), |a| %.3f, buffer %d",
-                    episode_id, step_id, dt_ms, float(info.get("sample_time", 0.0)),
+                    "ep %d decision %d: %.0f ms, |a| %.3f, buffer %d",
+                    episode_id, step_id, dt_ms,
                     float(np.linalg.norm(executed[0, :3])), len(self.replay),
                 )
             return {
