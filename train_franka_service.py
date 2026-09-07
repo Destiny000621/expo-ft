@@ -395,7 +395,7 @@ class Learner:
             return None
         import wandb  # noqa: PLC0415
 
-        wandb.init(
+        kwargs = dict(
             project=self.v.wandb_project,
             name=self.v.run_name,
             group=self.v.wandb_group or None,
@@ -403,6 +403,18 @@ class Learner:
             resume="allow",
             id=self.v.run_name,
         )
+        try:
+            # Bounded: with the API unreachable, wandb.init retries FOREVER and the
+            # learner never comes up (live 2026-09-07: "Network error (ConnectTimeout),
+            # entering retry loop" on a resume). A curve is not worth a robot session.
+            wandb.init(settings=wandb.Settings(init_timeout=45), **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "wandb online init failed (%s) — continuing in OFFLINE mode. Sync later "
+                "from the learner box with:  wandb sync %s/wandb/offline-run-*",
+                type(exc).__name__, os.getcwd(),
+            )
+            wandb.init(mode="offline", **kwargs)
         # `updates` is the x-axis, declared as a step METRIC rather than passed as
         # wandb's global step: a resumed run whose checkpoint did not survive
         # restarts `updates` at 0 while the wandb run already holds later steps, and
